@@ -8,14 +8,12 @@
 <summary><b>Citation</b></summary>
 
 ```bibtex
-@misc{an2026qedopensourcemultiagentgenerating,
-      title={QED: An Open-Source Multi-Agent System for Generating Mathematical Proofs on Open Problems},
-      author={Chenyang An and Qihao Ye and Minghao Pan and Jiayaun Zhang},
-      year={2026},
-      eprint={2604.24021},
-      archivePrefix={arXiv},
-      primaryClass={cs.AI},
-      url={https://arxiv.org/abs/2604.24021},
+@inproceedings{an2026qed,
+    title={{QED}: An Open-Source Multi-Agent System for Generating Mathematical Proofs on Open Problems},
+    author={Chenyang An and Qihao Ye and Minghao Pan and Jiayun Zhang},
+    booktitle={3rd AI for Math Workshop: Toward Self-Evolving Scientific Agents},
+    year={2026},
+    url={https://openreview.net/forum?id=EPCNlZRUc3}
 }
 ```
 
@@ -143,16 +141,18 @@ This is a technically nontrivial PhD-level problem in probability theory. Withou
 
 **Domain:** Inverse problems, Carleman estimates, wave equations on half-infinite domains.
 
-**What QED solved:** QED found a smooth space-time weight function (with auxiliary parameters) for the wave operator on a half-infinite domain satisfying global pseudoconvexity, growth, and positivity constraints required to validate a Carleman estimate, and gave proofs characterizing the admissible parameter regime ensuring these conditions hold.
+**QED contribution:** An early version of QED identified a characteristic-aligned logarithmic weight with sample parameters through seven search rounds under author-derived screening criteria.
 
-**Experts:** Qiao Zhuang (University of Missouri-Kansas City), Qihao Ye (University of California, San Diego), and Zhongqiang Zhang (Worcester Polytechnic Institute). They formulated the question, verified the QED-generated proof, and carried out the dependent mathematical work.
+**Paper results:** The authors independently derived the admissible parameter ranges and certified the weight. They proved a global half-line Carleman estimate, weighted conditional lateral Cauchy stability, and a finite-depth semilinear reconstruction result with an endpoint graph stabilizer; they also performed the numerical experiments.
 
-**Workflow:** Experts gave QED the problem: finding a function that satisfies the constraints. QED returned a candidate with proof. Experts found that the constraints were too weak (they had initially given the wrong problem). Experts strengthened the constraints, gave the problem back to QED, and instructed QED to continue the search starting from the previous candidate. QED then returned the final candidate and the proofs. In the entire loop, there was no human intervention besides the experts changing their problem statement once.
+**Experts:** Qiao Zhuang (University of Missouri-Kansas City), Qihao Ye (University of California, San Diego), Zhongqiang Zhang (Worcester Polytechnic Institute), and Yu Wang (Southwest Jiaotong University).
 
-**Problems and proofs:** Will be released after the paper is arxived.
+**Paper:** Chenyang An, Yu Wang, Qihao Ye, Zhongqiang Zhang, and Qiao Zhuang (2026). [Carleman Estimates for Wave Equations on the Half-Line: AI-Assisted Weights and Applications (arXiv:2609.06283)](https://arxiv.org/abs/2609.06283). See Appendix A for discovery and Appendix B for author-led parameter analysis.
+
+**Search archive and report:** [Code, prompts, and seven-round records](https://github.com/proofQED/QED_wave_Carleman); [Verification Report — Round 7](https://github.com/proofQED/QED_wave_Carleman/blob/893b18ae7f0a701f40883d4df318c1354a70b903/candidates/winning_report.md). The archived AI-generated report checks simplified search conditions; the paper supplies the final mathematical certification. See the [case notes and BibTeX citations](proved_statements/pde-Mar-23-2026/README.md#citations).
 
 <details>
-<summary><b>Expert comment (Qiao Zhuang, Qihao Ye, Zhongqiang Zhang)</b></summary>
+<summary><b>Expert comment (Qiao Zhuang, Qihao Ye, Zhongqiang Zhang, Yu Wang)</b></summary>
 
 The use of LLM-based search aims to replace the traditional hand-crafted process of identifying suitable Carleman weight functions for deriving Carleman estimates. This process is often difficult, highly problem-dependent, and time-consuming, and may still fail to produce a valid construction through manual trial. By automating the search over admissible weight functions under the required structural and inequality constraints, the approach has the potential to systematically explore viable candidates, thereby reducing reliance on ad hoc intuition and extensive analytical effort. This is particularly important for inverse problems, where the construction of an appropriate Carleman weight is a central and highly nontrivial step that directly impacts stability and uniqueness results. An LLM-assisted search framework can help identify feasible weight structures, guide the design of admissible functions, and accelerate the development of Carleman-based methodologies, thereby extending their applicability to more complex or less structured problems. The contribution produced by QED appears comparable in scope and technical depth to specialized analysis papers published in venues such as Journal of Mathematical Analysis and Applications
 
@@ -173,60 +173,76 @@ The pipeline runs in three stages: literature survey (Stage 0), the decompositio
 
 | Dependency | Purpose | Install |
 |------------|---------|---------|
-| Python 3.11+ | Pipeline runtime | `conda create -n agent python=3.11 -y` |
+| Python 3.11+ | Pipeline runtime | [python.org](https://www.python.org/downloads/) or conda |
 | `pyyaml` | Config parsing | `pip install pyyaml` |
-| [Claude CLI](https://docs.anthropic.com/en/docs/claude-code) | LLM backend | `npm install -g @anthropic-ai/claude-code` |
+| [Claude CLI](https://code.claude.com/docs/en/setup) | LLM backend | `curl -fsSL https://claude.ai/install.sh \| bash` (macOS/Linux/WSL) |
 | [Codex CLI](https://github.com/openai/codex) | LLM backend | `npm install -g @openai/codex` |
 | [Gemini CLI](https://github.com/google-gemini/gemini-cli) | LLM backend | `npm install -g @google/gemini-cli` |
 
 You need at least one model CLI installed. Install only the ones you plan to use — every agent role in `config.yaml` can be set to `"claude"`, `"codex"`, or `"gemini"`.
 
-RECOMMENDATION: USE CODEX GPT-5.5-PRO (OR GPT-5.5) FOR THE BEST PEROFRMANCE. 
+The configuration prioritizes capability for mathematical proof search. Model selections were checked against official documentation on **September 22, 2026**:
+
+| Provider | Selected model | Reasoning |
+|----------|----------------|-----------|
+| Codex | [GPT-6 Astra](https://developers.openai.com/api/docs/models/gpt-6-astra) (`gpt-6-astra`), OpenAI's most capable model | `max` |
+| Claude | [Claude Fable 5.1](https://platform.claude.com/docs/en/models/fable-5-1/overview) (`claude-fable-5-1`), Anthropic's choice for the most demanding reasoning | Adaptive thinking; use `CLAUDE_CODE_EFFORT_LEVEL=max` for maximum effort |
+| Gemini | [Gemini 3.1 Pro Preview](https://ai.google.dev/gemini-api/docs/models/gemini-3.1-pro-preview) (`gemini-3.1-pro-preview`), selected for complex reasoning | `HIGH` for API access; CLI/model defaults for saved Google login (see subscription track) |
+
+All shipped agent roles use Codex and inherit its global model and reasoning setting. Change an agent's `provider` to use Claude or Gemini. These are provider-specific choices for this workflow, not a measured ranking on QED's problems. Fable 5.1 requires [Claude Code 2.1.257 or later](https://code.claude.com/docs/en/model-config).
 
 ### Installation
 
-> **Important:** the pipeline launcher (`run.sh`) is hard-wired to a conda environment named **`agent`** (`conda run -n agent`). The env name is not configurable, and **every Python dependency — `pyyaml`, the UI's `streamlit`, everything — must be installed inside this `agent` env**. Activate it before any `pip install` in the steps below.
+Clone the repository, then choose **either Python `venv` or Conda**:
 
 ```bash
-# 1. Clone the repo
 git clone https://github.com/proofQED/QED.git && cd QED
-
-# 2. Create and activate the `agent` conda env (name is REQUIRED — run.sh expects exactly this)
-conda create -n agent python=3.11 -y
-conda activate agent
-
-# 3. Install Python dependencies *inside* the `agent` env
-pip install pyyaml
-# If you plan to use the web UI, also:
-pip install -r ui/requirements.txt
-
-# 4. Install the model CLIs you plan to use (at least one). These are npm globals,
-#    not Python packages, so they live outside the conda env.
-npm install -g @anthropic-ai/claude-code   # Claude
-npm install -g @openai/codex               # Codex
-# Install Gemini CLI per Google's instructions
-
-# 5. Verify your CLIs work (send a real prompt, not just --version)
-claude "say hello"
-codex "say hello"                                  # if using Codex
-gemini -m gemini-3.1-pro-preview "say hello"       # if using Gemini
-
-# 6. Edit config.yaml — set your Claude provider and any optional model providers
 ```
+
+**Option A: Python `venv`**
+
+```bash
+python3.11 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r ui/requirements.txt
+```
+
+**Option B: Conda**
+
+```bash
+conda create -n agent python=3.11 pip -y
+conda activate agent
+python -m pip install -r ui/requirements.txt
+```
+
+For either option, point the launchers at the active environment:
+
+```bash
+export QED_PYTHON="$(python -c 'import sys; print(sys.executable)')"
+```
+
+In each new terminal or when switching environments, activate your chosen environment (`source .venv/bin/activate` or `conda activate agent`) and repeat the export. This ensures the terminal launchers use the selected environment even when both exist. Without `QED_PYTHON`, `run.sh` and `run_verifier.sh` prefer `.venv/bin/python`, then fall back to the Conda environment `agent`. The UI uses its own Python interpreter unless `QED_PYTHON` overrides it.
+
+Then install the model CLIs you plan to use:
+
+```bash
+# Install at least one model CLI; these are separate from Python dependencies.
+curl -fsSL https://claude.ai/install.sh | bash  # Claude (macOS/Linux/WSL)
+npm install -g @openai/codex               # Codex
+npm install -g @google/gemini-cli          # Gemini
+```
+
+You can also use an existing Python 3.11+ environment: activate it, install the dependencies, and set `QED_PYTHON` as above.
+
+Before launching QED, complete **[Track 1: API access](#track-1-api-access)** or **[Track 2: Subscription access](#track-2-subscription-access)** below for each model provider you use. Both tracks work with either Python environment and use the same UI, prover, and verifier commands. The default configuration needs only Codex authentication.
 
 ### Quick Start (UI Mode — Recommended)
 
-QED ships with a Streamlit web UI that lets you edit the problem, configure providers / per-agent models, launch and monitor the pipeline, and stream agent logs from your browser.
+After completing your chosen authentication track, launch QED's Streamlit web UI to edit the problem, configure providers / per-agent models, launch and monitor the pipeline, and stream agent logs from your browser.
 
 ```bash
-# 1. Activate the `agent` conda env (created in Installation above)
-conda activate agent
-
-# 2. Install UI dependencies (one-time — inside the `agent` env)
-pip install -r ui/requirements.txt
-
-# 3. Launch the UI
-streamlit run ui/app.py
+# Launch from your activated venv or Conda environment
+python -m streamlit run ui/app.py
 ```
 
 This opens the app in your browser (default: <http://localhost:8501>). From there:
@@ -242,7 +258,7 @@ The UI uses the same `pipeline.py` under the hood, so anything you can configure
 
 ### Quick Start (Terminal — Alternative)
 
-If you prefer to run from the command line:
+From your activated venv or Conda environment, with `QED_PYTHON` set as above:
 
 > **First:** write your problem statement in **`problem/problem.tex`** (LaTeX format).
 
@@ -265,6 +281,17 @@ Prove that there exists $c \in (0,1)$ such that
 
 When the run finishes, your proof is at `<output>/proof.md`. For Medium / Hard problems a summary of the proof effort is also written to `<output>/proof_effort_summary.md`; Easy problems take the short-circuit path described above and skip the summary stage.
 
+### Runtime Checks
+
+Run this from the repository root with your venv or Conda environment activated:
+
+```bash
+# Prompt/config checks plus a short live request to each enabled pipeline provider
+python code/smoke_test.py --config config.yaml
+```
+
+The live check requires authenticated model CLIs and consumes a small amount of model usage. It also runs automatically before `run.sh` starts the proof pipeline. A successful check requires the expected assistant response; CLI error output does not count as success.
+
 ## Standalone Proof Verifier
 
 A standalone tool for checking mathematical proofs or problem statements. Two modes:
@@ -273,6 +300,8 @@ A standalone tool for checking mathematical proofs or problem statements. Two mo
 - **Review a problem** (`--problem-only`): Takes just a problem statement and checks whether it is well-defined — reports on clarity, consistency, completeness, and soundness.
 
 Supports Claude, Codex, and Gemini. Provider settings are in the `standalone_verifier` section of `config.yaml`.
+
+Use your activated venv or Conda environment with `QED_PYTHON` set as described in Installation.
 
 ### Quick Start
 
@@ -313,7 +342,7 @@ bash run_verifier.sh problem.txt --problem-only
 bash run_verifier.sh problem.txt proof.txt --provider gemini
 
 # Override model
-bash run_verifier.sh problem.txt proof.txt --model sonnet
+bash run_verifier.sh problem.txt proof.txt --provider claude --model claude-fable-5-1
 ```
 
 ## Prover Pipeline
@@ -343,57 +372,156 @@ When a lower-level limit is exhausted, the system automatically escalates. When 
 
 ## Configuration
 
-### Claude Provider Setup
+Choose an authentication track for each provider you use. **Both tracks run through the model CLIs.** API access uses API credentials and provider billing; subscription access reuses a CLI account login and its allowance or usage credits. Model access and limits depend on that account.
 
-If using Claude, configure one of three providers in `config.yaml`:
+The snippets below update the corresponding sections of `config.yaml`; keep the remaining settings. All shipped agents use Codex. To enable Claude or Gemini, change the relevant agent's `provider` and remove incompatible per-agent model overrides, as described under [Per-Agent Model Selection](#per-agent-model-selection).
 
-**Option 1: Subscription (Pro/Max)** — No API key needed. Max required for `opus`.
+### Track 1: API access
 
-```yaml
-claude:
-  provider: "subscription"
-  subscription:
-    model: "opus"       # or "sonnet", "haiku"
+**Codex / OpenAI API**
+
+Create an API key in the [OpenAI Platform](https://platform.openai.com/api-keys), then authenticate Codex with it:
+
+```bash
+export OPENAI_API_KEY="your-openai-api-key"
+printenv OPENAI_API_KEY | codex login --with-api-key
+codex login status  # Confirm API-key authentication
 ```
 
-**Option 2: AWS Bedrock** — Requires `aws configure`.
+Keep the model configuration below. QED reuses Codex's saved credentials; it does not read an OpenAI API key from `config.yaml`.
 
 ```yaml
-claude:
-  provider: "bedrock"
-  bedrock:
-    model: "us.anthropic.claude-opus-4-6-v1[1m]"
-    aws_profile: "default"
+codex:
+  model: "gpt-6-astra"
+  reasoning_effort: "max"
 ```
 
-**Option 3: Anthropic API Key**
+These calls are billed to your OpenAI Platform account separately from a ChatGPT subscription. See the [official OpenAI authentication documentation](https://learn.chatgpt.com/docs/auth).
+
+**Claude / Anthropic API**
+
+Create a key in the [Claude Console](https://platform.claude.com/) and set:
 
 ```yaml
 claude:
   provider: "api_key"
   api_key:
-    model: "claude-opus-4-6"
-    key: "sk-ant-..."
+    model: "claude-fable-5-1"
+    key: "your-anthropic-api-key"
 ```
 
-### Codex and Gemini Setup (Optional)
+QED passes this key to Claude Code as `ANTHROPIC_API_KEY`. In this project, exporting that variable alone is insufficient: the runner clears it before applying `claude.api_key.key`. API usage uses your Anthropic API account. See [Claude Code authentication](https://code.claude.com/docs/en/authentication).
 
-**Codex** — just install the CLI; it handles its own authentication.
+**Gemini API**
 
-```yaml
-codex:
-  model: "gpt-5.4"
-  reasoning_effort: "xhigh"
-```
-
-**Gemini** — requires an API key from [Google AI Studio](https://makersuite.google.com/app/apikey) (or leave `api_key` empty if your Gemini CLI is already logged in with a subscription).
+Create a key in [Google AI Studio](https://aistudio.google.com/apikey) and set:
 
 ```yaml
 gemini:
   model: "gemini-3.1-pro-preview"
   thinking_level: "HIGH"
-  api_key: "your-key-here"
+  api_key: "your-gemini-api-key"
 ```
+
+QED passes this key as `GEMINI_API_KEY`. API quotas and billing apply independently of Google AI subscription access. See [Gemini CLI API-key authentication](https://geminicli.com/docs/get-started/authentication/#use-gemini-api-key).
+
+Claude and Gemini keys entered in `config.yaml` are also included in QED's saved run configuration; keep both the configuration and run outputs private.
+
+**Optional: Claude through AWS Bedrock**
+
+For AWS-billed access, configure credentials, model access, and a supported region in your AWS profile or `AWS_REGION`, following the [Claude Code Bedrock guide](https://code.claude.com/docs/en/amazon-bedrock):
+
+```yaml
+claude:
+  provider: "bedrock"
+  bedrock:
+    model: "anthropic.claude-fable-5-1"
+    aws_profile: "default"
+```
+
+QED sets `CLAUDE_CODE_USE_BEDROCK=1` and `AWS_PROFILE`. Use the Bedrock-specific model ID above for any Claude per-agent overrides too.
+
+### Track 2: Subscription access
+
+**Codex / ChatGPT subscription**
+
+**QED can use GPT-6 Astra through your ChatGPT/Codex subscription without an OpenAI API key**, provided your account and workspace have model access. Sign in through Codex:
+
+```bash
+codex login         # Sign in with ChatGPT in the browser
+codex login status  # Confirm: Logged in using ChatGPT
+```
+
+If switching from a saved API-key login, run `codex logout` before signing in again. Use the same model settings as the API track:
+
+```yaml
+codex:
+  model: "gpt-6-astra"
+  reasoning_effort: "max"
+```
+
+The pipeline and standalone verifier both call `codex exec` and reuse that login. Usage follows your Codex allowance and applicable credits. See the [official OpenAI authentication documentation](https://learn.chatgpt.com/docs/auth).
+
+**Claude subscription**
+
+Sign in to Claude Code with your eligible Claude account:
+
+```bash
+unset ANTHROPIC_API_KEY
+claude
+```
+
+Use `/login` to select the subscription account and `/status` to confirm the active authentication. Remove conflicting API or cloud-provider overrides from your shell or Claude settings if needed. Then set:
+
+```yaml
+claude:
+  provider: "subscription"
+  subscription:
+    model: "claude-fable-5-1"
+```
+
+No Anthropic API key is needed for this route. Fable access depends on your plan and may use paid usage credits; QED's non-interactive calls can consume those credits without an interactive consent prompt. See [Claude authentication](https://code.claude.com/docs/en/authentication) and [Fable usage credits](https://code.claude.com/docs/en/model-config#fable-and-usage-credits).
+
+**Gemini / Google account or subscription**
+
+Start Gemini CLI and select **Sign in with Google**. For Google AI Pro or Ultra, use the account associated with the subscription:
+
+```bash
+unset GEMINI_API_KEY GOOGLE_API_KEY GOOGLE_GENAI_USE_VERTEXAI
+gemini
+```
+
+Then set:
+
+```yaml
+gemini:
+  model: "gemini-3.1-pro-preview"
+  api_key: ""
+  thinking_level: ""
+  thinking_budget: null
+```
+
+Also remove any per-agent `thinking_level` or `thinking_budget` overrides. **This is required for cached-login use in the current QED runner:** explicit thinking overrides create a temporary Gemini home that does not contain your saved login. Empty thinking settings preserve the normal CLI configuration and model-default thinking. This does not change the selected model.
+
+Gemini headless calls can reuse a cached Google login; account eligibility, model access, and quotas still apply. See [Gemini CLI authentication](https://geminicli.com/docs/get-started/authentication/) and [Gemini CLI configuration](https://geminicli.com/docs/reference/configuration/).
+
+### Model versions and reasoning (both tracks)
+
+The selected models are listed under [Prerequisites](#prerequisites). Authentication changes how requests are authorized and billed; each agent still inherits its model settings from `config.yaml` unless overridden.
+
+For Claude Fable 5.1, use Claude Code **2.1.257 or later**. Update an existing native installation and request maximum reasoning effort:
+
+```bash
+claude update
+claude --version
+export CLAUDE_CODE_EFFORT_LEVEL=max
+```
+
+Launch QED from that shell so Claude calls inherit the effort setting. For other installation methods, follow the [Claude setup guide](https://code.claude.com/docs/en/setup). See [Claude model and effort configuration](https://code.claude.com/docs/en/model-config).
+
+For Codex, update with `npm install -g @openai/codex@latest` if your CLI does not support `max`. QED uses `max` with its own agent pipeline; Codex's `ultra` also enables automatic delegation. See [Codex models and reasoning](https://learn.chatgpt.com/docs/models).
+
+After completing either track, run the [Runtime Checks](#runtime-checks), then use the shared [UI](#quick-start-ui-mode--recommended), [terminal](#quick-start-terminal--alternative), or [standalone verifier](#standalone-proof-verifier) instructions above. The live check consumes usage under the authentication method you selected.
 
 ### Per-Agent Model Selection
 
@@ -404,17 +532,17 @@ decomposition:
   models:
     decomposer:
       provider: "codex"
-      model: "gpt-5.5"              # overrides global codex.model
-      reasoning_effort: "xhigh"     # overrides global codex.reasoning_effort
+      model: "gpt-6-astra"          # overrides global codex.model
+      reasoning_effort: "max"       # overrides global codex.reasoning_effort
 
     single_prover:
       provider: "claude"
-      model: "claude-opus-4-7"      # overrides whichever claude.*.model is active
+      model: "claude-fable-5-1"     # use anthropic.claude-fable-5-1 for Bedrock
 
     detailed_verifier:
       provider: "gemini"
       model: "gemini-3.1-pro-preview"
-      thinking_level: "HIGH"        # overrides global gemini.thinking_level
+      thinking_level: "HIGH"        # API track only; omit for saved Google login
 
     # Falls back entirely to global codex defaults
     structural_verifier:
@@ -438,9 +566,9 @@ See [`config.yaml`](config.yaml) for the full reference with comments. The most 
 | `pipeline.literature_survey` | Per-agent dict for the Stage 0 survey |
 | `pipeline.proof_summary` | Per-agent dict for the Stage 2 summary |
 | `decomposition.models.*` | Per-agent dicts for the six decomposition agents |
-| `decomposition.max_proof_attempts` | REVISE_PROOF limit (default: 4) |
-| `decomposition.max_revisions` | REVISE_PLAN limit (default: 4) |
-| `decomposition.max_decompositions` | REWRITE limit (default: 4) |
+| `decomposition.max_proof_attempts` | REVISE_PROOF limit (configured: 8) |
+| `decomposition.max_revisions` | REVISE_PLAN limit (configured: 4) |
+| `decomposition.max_decompositions` | REWRITE limit (configured: 4) |
 | `standalone_verifier.*` | Per-agent dicts for the four standalone-verifier agents |
 
 ## Pipeline Details

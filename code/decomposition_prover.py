@@ -38,12 +38,12 @@ DEFAULT_CONFIG = {
 }
 
 DEFAULT_MODELS = {
-    "decomposer": {"provider": "codex", "model": "gpt-5.5-pro"},
-    "single_prover": {"provider": "codex", "model": "gpt-5.5"},
-    "regulator": {"provider": "codex", "model": "gpt-5.5"},
-    "structural_verifier": {"provider": "codex", "model": "gpt-5.5"},
-    "detailed_verifier": {"provider": "codex", "model": "gpt-5.5"},
-    "verdict": {"provider": "codex", "model": "gpt-5.5"},
+    "decomposer": {"provider": "codex"},
+    "single_prover": {"provider": "codex"},
+    "regulator": {"provider": "codex"},
+    "structural_verifier": {"provider": "codex"},
+    "detailed_verifier": {"provider": "codex"},
+    "verdict": {"provider": "codex"},
 }
 
 
@@ -725,18 +725,18 @@ def get_claude_opts_for_role(config: dict, role_cfg: dict) -> dict:
     auth_mode = claude_cfg.get("provider", "subscription")
     model_override = role_cfg.get("model")
     if auth_mode == "subscription":
-        model = model_override or claude_cfg.get("subscription", {}).get("model", "opus")
+        model = model_override or claude_cfg.get("subscription", {}).get("model", "claude-fable-5-1")
         env = {}
     elif auth_mode == "bedrock":
         bedrock = claude_cfg.get("bedrock", {})
-        model = model_override or bedrock.get("model", "us.anthropic.claude-opus-4-6-v1[1m]")
+        model = model_override or bedrock.get("model", "anthropic.claude-fable-5-1")
         env = {
             "CLAUDE_CODE_USE_BEDROCK": "1",
             "AWS_PROFILE": bedrock.get("aws_profile", "default"),
         }
     elif auth_mode == "api_key":
         api_cfg = claude_cfg.get("api_key", {})
-        model = model_override or api_cfg.get("model", "claude-opus-4-6")
+        model = model_override or api_cfg.get("model", "claude-fable-5-1")
         env = {"ANTHROPIC_API_KEY": api_cfg.get("key", "")}
     else:
         raise ValueError(

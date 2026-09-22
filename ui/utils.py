@@ -38,7 +38,7 @@ AGENT_NAMES = (
 # Stage 0 and Stage 2 agents (config.yaml: pipeline.*)
 PIPELINE_AGENT_NAMES = ("literature_survey", "proof_summary")
 
-CODEX_REASONING_LEVELS = ("xhigh", "high", "medium", "low")
+CODEX_REASONING_LEVELS = ("max", "xhigh", "high", "medium", "low")
 GEMINI_THINKING_LEVELS = ("HIGH", "MEDIUM", "LOW", "NONE")
 
 

@@ -332,7 +332,7 @@ async def run_smoke_test(config: dict, config_path: str | None = None) -> bool:
         # Build options via make_claude_options so we get the right model
         # and env vars for the configured provider.
         try:
-            opts = make_claude_options(claude_cfg, tempfile.mkdtemp())
+            opts = make_claude_options(claude_cfg, tempfile.gettempdir())
         except ValueError as e:
             check(f"Claude config valid ({provider})", False, str(e))
             opts = None
@@ -355,17 +355,16 @@ async def run_smoke_test(config: dict, config_path: str | None = None) -> bool:
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                     env=clean_env, text=True, timeout=60,
                 )
-                import json as _json
-                try:
-                    data = _json.loads(result.stdout)
-                    text = data.get("result", "")
-                except (ValueError, KeyError):
-                    text = result.stdout
+                data = json.loads(result.stdout)
+                text = data.get("result", "")
+                check("Claude CLI exits successfully",
+                      result.returncode == 0 and not data.get("is_error", False),
+                      f"Exit code {result.returncode}, stderr: {result.stderr[:200]}")
                 check(f"Claude CLI responds ({provider}, model={model})",
                       len(text) > 0,
                       f"Empty response, stderr: {result.stderr[:200]}")
                 check("Claude CLI response valid",
-                      "SMOKE_TEST_OK" in text.upper() or "smoke" in text.lower(),
+                      text.strip() == "SMOKE_TEST_OK",
                       f"Got: {text[:100]}")
             except subprocess.TimeoutExpired:
                 check(f"Claude CLI responds ({provider})", False, "Timed out after 60s")
@@ -373,7 +372,7 @@ async def run_smoke_test(config: dict, config_path: str | None = None) -> bool:
                 check(f"Claude CLI connectivity ({provider})", False, str(e))
     else:
         check(f"Claude CLI '{cli_path}' found", False,
-              "Install claude CLI: npm install -g @anthropic-ai/claude-code")
+              "Install Claude Code using the instructions in README.md")
 
     # -------------------------------------------------------
     # Test 6: Config validation
@@ -451,22 +450,31 @@ async def run_smoke_test(config: dict, config_path: str | None = None) -> bool:
             codex_cli = codex_cfg.get("cli_path", "codex")
             if shutil.which(codex_cli) is not None:
                 try:
-                    codex_model = codex_cfg.get("model", "gpt-5.5")
-                    codex_reasoning = codex_cfg.get("reasoning_effort", "xhigh")
-                    codex_cwd = tempfile.mkdtemp()
+                    codex_model = codex_cfg.get("model", "gpt-6-astra")
+                    codex_reasoning = codex_cfg.get("reasoning_effort", "max")
                     # Mirror model_runner.run_codex_agent so the exit-code
                     # check reflects how Codex behaves at runtime.
-                    codex_result = subprocess.run(
-                        [codex_cli, "--search", "-m", codex_model,
-                         "-c", f'model_reasoning_effort="{codex_reasoning}"',
-                         "exec", "--json",
-                         "--dangerously-bypass-approvals-and-sandbox",
-                         "-C", codex_cwd,
-                         "Reply with exactly: SMOKE_TEST_OK"],
-                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                        text=True, timeout=120, cwd=codex_cwd,
-                    )
-                    codex_resp = codex_result.stdout.strip()
+                    with tempfile.TemporaryDirectory(prefix="qed-codex-smoke-") as codex_cwd:
+                        codex_result = subprocess.run(
+                            [codex_cli, "--search", "-m", codex_model,
+                             "-c", f'model_reasoning_effort="{codex_reasoning}"',
+                             "exec", "--json",
+                             "--skip-git-repo-check",
+                             "--dangerously-bypass-approvals-and-sandbox",
+                             "-C", codex_cwd,
+                             "Reply with exactly: SMOKE_TEST_OK"],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, timeout=120, cwd=codex_cwd,
+                        )
+                    codex_resp = ""
+                    for line in codex_result.stdout.splitlines():
+                        if not line.strip():
+                            continue
+                        event = _json_test.loads(line)
+                        if event.get("type") == "item.completed":
+                            item = event.get("item", {})
+                            if item.get("type") == "agent_message":
+                                codex_resp = item.get("text", "").strip()
                     # Non-zero exit is treated as a warning if a response was
                     # produced (matches run_codex_agent's tolerance).
                     exit_ok = codex_result.returncode == 0 or bool(codex_resp)
@@ -475,7 +483,7 @@ async def run_smoke_test(config: dict, config_path: str | None = None) -> bool:
                           f"Exit code {codex_result.returncode}, stderr: {codex_result.stderr[:200]}")
                     check("Codex responds", len(codex_resp) > 0, "Empty response")
                     check("Codex response valid",
-                          "smoke" in codex_resp.lower() or "ok" in codex_resp.lower() or len(codex_resp) > 5,
+                          codex_resp == "SMOKE_TEST_OK",
                           f"Got: {codex_resp[:100]}")
                 except subprocess.TimeoutExpired:
                     check("Codex connectivity", False, "Timed out after 120s")
@@ -492,7 +500,7 @@ async def run_smoke_test(config: dict, config_path: str | None = None) -> bool:
             gemini_api_key = gemini_cfg.get("api_key", "")
             if shutil.which(gemini_cli) is not None:
                 try:
-                    gemini_model = gemini_cfg.get("model", "gemini-3-flash-preview")
+                    gemini_model = gemini_cfg.get("model", "gemini-3.1-pro-preview")
                     gemini_approval_mode = gemini_cfg.get("approval_mode", "yolo")
                     gemini_thinking_level = gemini_cfg.get("thinking_level", "")
                     gemini_thinking_budget = gemini_cfg.get("thinking_budget")
@@ -544,16 +552,12 @@ async def run_smoke_test(config: dict, config_path: str | None = None) -> bool:
                     check("Gemini CLI exits cleanly", gemini_result.returncode == 0,
                           f"Exit code {gemini_result.returncode}, stderr: {gemini_result.stderr[:300]}")
                     # Parse JSON response
-                    gemini_resp = ""
-                    try:
-                        gemini_data = _json_test.loads(gemini_result.stdout)
-                        gemini_resp = gemini_data.get("response", "")
-                    except (ValueError, KeyError):
-                        gemini_resp = gemini_result.stdout.strip()
+                    gemini_data = _json_test.loads(gemini_result.stdout)
+                    gemini_resp = gemini_data.get("response", "")
                     check("Gemini responds", len(gemini_resp) > 0,
                           f"Empty response, stdout: {gemini_result.stdout[:200]}")
                     check("Gemini response valid",
-                          "smoke" in gemini_resp.lower() or "ok" in gemini_resp.lower() or len(gemini_resp) > 5,
+                          not gemini_data.get("error") and gemini_resp.strip() == "SMOKE_TEST_OK",
                           f"Got: {gemini_resp[:100]}")
                 except subprocess.TimeoutExpired:
                     check("Gemini connectivity", False, "Timed out after 120s")

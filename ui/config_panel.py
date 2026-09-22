@@ -50,17 +50,15 @@ def _render_claude_block(claude_cfg: dict) -> dict:
         key="claude_provider",
     )
 
-    sub_model = sub_cfg.get("model", "opus")
-    bed_model = bed_cfg.get("model", "us.anthropic.claude-opus-4-6-v1[1m]")
+    sub_model = sub_cfg.get("model", "claude-fable-5-1")
+    bed_model = bed_cfg.get("model", "anthropic.claude-fable-5-1")
     bed_profile = bed_cfg.get("aws_profile", "default")
-    api_model = api_cfg.get("model", "claude-opus-4-6")
+    api_model = api_cfg.get("model", "claude-fable-5-1")
     api_key_val = api_cfg.get("key", "")
 
     if claude_provider == "subscription":
-        opts = ["opus", "sonnet", "haiku"]
-        cur = sub_model if sub_model in opts else "opus"
-        sub_model = st.sidebar.selectbox(
-            "Model", opts, index=opts.index(cur), key="claude_sub_model",
+        sub_model = st.sidebar.text_input(
+            "Model", value=sub_model, key="claude_sub_model",
         )
     elif claude_provider == "bedrock":
         bed_model = st.sidebar.text_input(
@@ -90,24 +88,25 @@ def _render_claude_block(claude_cfg: dict) -> dict:
         )
 
     return {
+        **claude_cfg,
         "cli_path": cli_path,
         "permission_mode": perm_mode,
         "provider": claude_provider,
-        "subscription": {"model": sub_model},
-        "bedrock": {"model": bed_model, "aws_profile": bed_profile},
-        "api_key": {"model": api_model, "key": api_key_val},
+        "subscription": {**sub_cfg, "model": sub_model},
+        "bedrock": {**bed_cfg, "model": bed_model, "aws_profile": bed_profile},
+        "api_key": {**api_cfg, "model": api_model, "key": api_key_val},
     }
 
 
 def _render_codex_block(codex_cfg: dict) -> dict:
     st.sidebar.subheader("Codex (OpenAI)")
     codex_model = st.sidebar.text_input(
-        "Model", value=codex_cfg.get("model", "gpt-5.5"),
+        "Model", value=codex_cfg.get("model", "gpt-6-astra"),
         key="codex_model",
     )
-    cur_effort = codex_cfg.get("reasoning_effort", "xhigh")
+    cur_effort = codex_cfg.get("reasoning_effort", "max")
     if cur_effort not in CODEX_REASONING_LEVELS:
-        cur_effort = "xhigh"
+        cur_effort = "max"
     codex_effort = st.sidebar.selectbox(
         "Reasoning effort", list(CODEX_REASONING_LEVELS),
         index=CODEX_REASONING_LEVELS.index(cur_effort),
@@ -119,6 +118,7 @@ def _render_codex_block(codex_cfg: dict) -> dict:
             key="codex_cli",
         )
     return {
+        **codex_cfg,
         "cli_path": codex_cli,
         "model": codex_model,
         "reasoning_effort": codex_effort,
@@ -131,12 +131,16 @@ def _render_gemini_block(gemini_cfg: dict) -> dict:
         "Model", value=gemini_cfg.get("model", "gemini-3.1-pro-preview"),
         key="gemini_model",
     )
-    cur_think = gemini_cfg.get("thinking_level", "HIGH")
-    if cur_think not in GEMINI_THINKING_LEVELS:
+    thinking_options = ("", *GEMINI_THINKING_LEVELS)
+    cur_think = gemini_cfg.get(
+        "thinking_level", "" if gemini_cfg.get("thinking_budget") is not None else "HIGH",
+    )
+    if cur_think not in thinking_options:
         cur_think = "HIGH"
     gemini_think = st.sidebar.selectbox(
-        "Thinking level", list(GEMINI_THINKING_LEVELS),
-        index=GEMINI_THINKING_LEVELS.index(cur_think),
+        "Thinking level", list(thinking_options),
+        index=thinking_options.index(cur_think),
+        format_func=lambda level: level or "(model default)",
         key="gemini_think",
     )
     gemini_api = st.sidebar.text_input(
@@ -154,6 +158,7 @@ def _render_gemini_block(gemini_cfg: dict) -> dict:
             key="gemini_approval",
         )
     return {
+        **gemini_cfg,
         "cli_path": gemini_cli,
         "model": gemini_model,
         "approval_mode": gemini_approval,
@@ -230,7 +235,10 @@ def _agent_block(name: str, agent_cfg: dict) -> dict:
                 key=f"agent_{name}_thinking_budget",
             )
 
-    out: dict = {"provider": provider}
+    out = {k: v for k, v in agent_cfg.items()
+           if k not in ("provider", "model", "reasoning_effort",
+                        "thinking_level", "thinking_budget")}
+    out["provider"] = provider
     if model_value.strip():
         out["model"] = model_value.strip()
     if reasoning_value and reasoning_value != _USE_GLOBAL:

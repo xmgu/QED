@@ -307,6 +307,8 @@ TSWLatexianTemp*
 *api*
 
 __pycache__/
+.venv/
+/test/
 docs/
 *.pyc
 

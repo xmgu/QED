@@ -98,7 +98,7 @@ async def run_claude_agent(
         instructions: Optional system prompt to append.
     """
     cli_path = claude_opts.get("cli_path", "claude")
-    model = claude_opts.get("model", "opus")
+    model = claude_opts.get("model", "claude-fable-5-1")
     extra_env = claude_opts.get("env", {})
 
     cmd = [
@@ -281,8 +281,8 @@ async def run_codex_agent(
         call_name: Human-readable label for this call.
     """
     cli_path = codex_config.get("cli_path", "codex")
-    model = codex_config.get("model", "gpt-5.5")
-    reasoning = codex_config.get("reasoning_effort", "xhigh")
+    model = codex_config.get("model", "gpt-6-astra")
+    reasoning = codex_config.get("reasoning_effort", "max")
 
     cmd = [
         cli_path,
@@ -291,6 +291,7 @@ async def run_codex_agent(
         "-c", f'model_reasoning_effort="{reasoning}"',
         "exec",
         "--json",
+        "--skip-git-repo-check",
         "--dangerously-bypass-approvals-and-sandbox",
         "-C", working_dir,
         prompt,
@@ -355,8 +356,8 @@ async def run_codex_agent(
             logger.log(f"[Codex] JSON parse error: {exc}")
             if result.stdout.strip():
                 logger.log(f"[Codex] Raw stdout (first 1000 chars): {result.stdout.strip()[:1000]}")
-        # Fall back to raw stdout as response
-        response = result.stdout.strip()
+        # JSON mode must produce an assistant message, not raw CLI diagnostics.
+        response = ""
 
     # The Codex CLI sometimes exits non-zero (e.g. "Reading additional input
     # from stdin..." warning → exit code 1) even when it produced a valid
@@ -431,7 +432,7 @@ async def run_gemini_agent(
         call_name: Human-readable label for this call.
     """
     cli_path = gemini_config.get("cli_path", "gemini")
-    model = gemini_config.get("model", "gemini-3-flash-preview")
+    model = gemini_config.get("model", "gemini-3.1-pro-preview")
     api_key = gemini_config.get("api_key", "")
     approval_mode = gemini_config.get("approval_mode", "yolo")
     thinking_level = gemini_config.get("thinking_level", "")

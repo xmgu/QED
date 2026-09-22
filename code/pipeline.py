@@ -42,7 +42,7 @@ def make_claude_options(claude_cfg: dict, working_dir: str) -> dict:
     """Build options dict for the Claude CLI subprocess runner.
 
     Supports three providers:
-      - "subscription": Claude Pro/Max subscription (no keys, shorthand model names)
+      - "subscription": Claude Pro/Max subscription (no keys, model IDs or aliases)
       - "bedrock": AWS Bedrock (requires AWS credentials)
       - "api_key": Anthropic API key (requires ANTHROPIC_API_KEY)
     """
@@ -51,10 +51,10 @@ def make_claude_options(claude_cfg: dict, working_dir: str) -> dict:
 
     if provider == "subscription":
         sub_cfg = claude_cfg.get("subscription", {})
-        model = sub_cfg.get("model", "opus")
+        model = sub_cfg.get("model", "claude-fable-5-1")
     elif provider == "api_key":
         api_cfg = claude_cfg.get("api_key", {})
-        model = api_cfg.get("model", "claude-opus-4-6")
+        model = api_cfg.get("model", "claude-fable-5-1")
         key = api_cfg.get("key", "")
         if key:
             env["ANTHROPIC_API_KEY"] = key
@@ -63,7 +63,7 @@ def make_claude_options(claude_cfg: dict, working_dir: str) -> dict:
         # If Claude is later invoked, the CLI will surface its own auth error.
     elif provider == "bedrock":
         bedrock_cfg = claude_cfg.get("bedrock", {})
-        model = bedrock_cfg.get("model", "us.anthropic.claude-opus-4-6-v1[1m]")
+        model = bedrock_cfg.get("model", "anthropic.claude-fable-5-1")
         env["CLAUDE_CODE_USE_BEDROCK"] = "1"
         env["AWS_PROFILE"] = bedrock_cfg.get("aws_profile", "default")
     else:
@@ -77,22 +77,22 @@ def make_claude_options(claude_cfg: dict, working_dir: str) -> dict:
     }
 
 
-def check_prerequisites():
-    """Check that required tools are available."""
-    missing = []
-    for cmd in ["claude", "python3"]:
-        if shutil.which(cmd) is None:
-            missing.append(cmd)
+def check_prerequisites(config: dict):
+    """Check only the CLIs used by the configured pipeline roles."""
+    from decomposition_prover import DEFAULT_MODELS, get_agent_role_cfg
+    from model_runner import resolve_agent_provider_config
+
+    roles = [config.get("pipeline", {}).get(name, {})
+             for name in ("literature_survey", "proof_summary")]
+    roles.extend(get_agent_role_cfg(config, name) for name in DEFAULT_MODELS)
+    commands = set()
+    for role in roles:
+        provider, provider_cfg = resolve_agent_provider_config(config, role)
+        commands.add(provider_cfg.get("cli_path", provider))
+    missing = sorted(cmd for cmd in commands if shutil.which(cmd) is None)
     if missing:
         print(f"ERROR: Missing required tools: {', '.join(missing)}")
         print("Please install them before running the pipeline.")
-        sys.exit(1)
-    try:
-        import yaml as _y  # noqa: F401
-    except ImportError:
-        missing.append("pyyaml (pip install pyyaml)")
-    if missing:
-        print(f"ERROR: Missing Python packages: {', '.join(missing)}")
         sys.exit(1)
 
 
@@ -418,7 +418,7 @@ async def run_agent(
     ``claude_opts["cwd"]`` and has full tool access (file read/write, bash).
     """
     cli_path = claude_opts.get("cli_path", "claude")
-    model = claude_opts.get("model", "opus")
+    model = claude_opts.get("model", "claude-fable-5-1")
     cwd = claude_opts.get("cwd", ".")
     extra_env = claude_opts.get("env", {})
 
@@ -667,10 +667,10 @@ async def main():
     parser.add_argument("--config", required=True, help="Path to config.yaml")
     args = parser.parse_args()
 
-    check_prerequisites()
-
     with open(args.config) as f:
         config = yaml.safe_load(f)
+
+    check_prerequisites(config)
 
     claude_cfg = config.get("claude", {})
     prover_mode = config.get("prover", {}).get("mode", "decomposition")

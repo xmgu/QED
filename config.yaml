@@ -8,8 +8,13 @@
 # =============================================================================
 # MODEL PROVIDERS
 # =============================================================================
+# Capability-focused defaults verified 2026-09-22 for mathematical proof search.
 
 # --- Claude (Anthropic) ---
+# Fable 5.1 requires Claude Code 2.1.257 or later.
+# Anthropic's most capable generally available model for demanding reasoning:
+# https://platform.claude.com/docs/en/models/fable-5-1/overview
+# For maximum Claude effort, launch with CLAUDE_CODE_EFFORT_LEVEL=max.
 claude:
   cli_path: "claude"
   permission_mode: "bypassPermissions"
@@ -18,30 +23,33 @@ claude:
   provider: "api_key"
 
   # --- Option 1: Claude subscription (Pro/Max) ---
-  # No API key needed. Use "claude-opus-5" for Opus 5.
+  # No API key needed; requires Fable access on your plan.
   subscription:
-    model: "claude-fable-5"
+    model: "claude-fable-5-1"
 
   # --- Option 2: AWS Bedrock ---
   bedrock:
-    model: "us.anthropic.claude-fable-5[1m]"  # or "us.anthropic.claude-opus-5[1m]"
+    model: "anthropic.claude-fable-5-1"  # 1M context by default
     aws_profile: "default"
 
   # --- Option 3: Anthropic API key ---
   api_key:
-    model: "claude-fable-5"  # or "claude-opus-5"
+    model: "claude-fable-5-1"
     key: ""  # paste your Anthropic API key here
 
 # --- Codex (OpenAI) ---
+# https://developers.openai.com/api/docs/models/gpt-6-astra
 codex:
   cli_path: "codex"
-  model: "gpt-5.6-sol"
-  reasoning_effort: "xhigh"
+  model: "gpt-6-astra"
+  reasoning_effort: "max"  # maximum single-agent reasoning
 
 # --- Gemini (Google) ---
+# Pro is selected for complex reasoning; HIGH maximizes its thinking depth.
+# https://ai.google.dev/gemini-api/docs/models/gemini-3.1-pro-preview
 gemini:
   cli_path: "gemini"
-  model: "gemini-3.1-pro-preview"  # or "gemini-3-flash-preview"
+  model: "gemini-3.1-pro-preview"
   approval_mode: "yolo"
   thinking_level: "HIGH"  # Gemini 3 thinking strength; for Gemini 2.5 use thinking_budget instead
   api_key: ""  # paste your Google Gemini API key here, leave empty if Gemini CLI is already logged in with subscription
@@ -100,18 +108,14 @@ decomposition:
   # Per-agent model selection. Each entry is a dict like:
   #   decomposer:
   #     provider: "codex"
-  #     model: "gpt-5.6-sol"       # optional — overrides global codex.model
-  #     reasoning_effort: "xhigh"  # optional — overrides global codex.reasoning_effort
+  #     model: "gpt-6-astra"        # optional — overrides global codex.model
+  #     reasoning_effort: "max"    # optional — overrides global codex.reasoning_effort
   # Unset knobs fall back to the global codex:/gemini:/claude: section.
   models:
     decomposer:
       provider: "codex"           # creates/revises proof decomposition plan
-      model: "gpt-5.6-sol"
-      reasoning_effort: "xhigh"
     single_prover:
       provider: "codex"           # executes decomposition plan, writes complete proof
-      model: "gpt-5.6-sol"
-      reasoning_effort: "xhigh"
     regulator:
       provider: "codex"           # decides REVISE_PROOF/REVISE_PLAN/REWRITE after verification fails
     structural_verifier:

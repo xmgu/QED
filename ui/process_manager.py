@@ -4,6 +4,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 
 from utils import (
     PROJECT_ROOT,
@@ -44,6 +45,8 @@ def start_pipeline(
     os.makedirs(output_abs, exist_ok=True)
     log_path = os.path.join(output_abs, "pipeline_stdout.log")
     log_fh = open(log_path, "a")
+    env = os.environ.copy()
+    env.setdefault("QED_PYTHON", sys.executable)
 
     proc = subprocess.Popen(
         ["bash", RUN_SH, problem_abs, output_abs, config_abs],
@@ -51,6 +54,7 @@ def start_pipeline(
         stderr=subprocess.STDOUT,
         preexec_fn=os.setsid,
         cwd=PROJECT_ROOT,
+        env=env,
     )
     proc._log_fh = log_fh
     return proc

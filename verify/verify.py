@@ -12,7 +12,7 @@ Usage:
     python verify/verify.py problem.txt --problem-only         # problem-only mode
     python verify/verify.py problem.txt proof.txt -o report.md
     python verify/verify.py problem.txt proof.txt --provider gemini
-    python verify/verify.py problem.txt proof.txt --model sonnet
+    python verify/verify.py problem.txt proof.txt --provider claude --model claude-fable-5-1
     python verify/verify.py problem.txt proof.txt --config /path/to/config.yaml
 """
 from __future__ import annotations
@@ -58,10 +58,10 @@ def make_claude_options(claude_cfg: dict) -> dict:
 
     if provider == "subscription":
         sub_cfg = claude_cfg.get("subscription", {})
-        model = sub_cfg.get("model", "opus")
+        model = sub_cfg.get("model", "claude-fable-5-1")
     elif provider == "api_key":
         api_cfg = claude_cfg.get("api_key", {})
-        model = api_cfg.get("model", "claude-opus-4-6")
+        model = api_cfg.get("model", "claude-fable-5-1")
         key = api_cfg.get("key", "")
         if key:
             env["ANTHROPIC_API_KEY"] = key
@@ -70,7 +70,7 @@ def make_claude_options(claude_cfg: dict) -> dict:
         # is later invoked, the CLI will surface its own auth error.
     elif provider == "bedrock":
         bedrock_cfg = claude_cfg.get("bedrock", {})
-        model = bedrock_cfg.get("model", "us.anthropic.claude-opus-4-6-v1[1m]")
+        model = bedrock_cfg.get("model", "anthropic.claude-fable-5-1")
         env["CLAUDE_CODE_USE_BEDROCK"] = "1"
         env["AWS_PROFILE"] = bedrock_cfg.get("aws_profile", "default")
     else:
@@ -160,7 +160,7 @@ def load_prompt(path: str, **kwargs) -> str:
 def run_claude(prompt: str, claude_opts: dict, model_override: str | None = None) -> str:
     """Invoke Claude CLI and return response text."""
     cli_path = claude_opts.get("cli_path", "claude")
-    model = model_override or claude_opts.get("model", "opus")
+    model = model_override or claude_opts.get("model", "claude-fable-5-1")
     extra_env = claude_opts.get("env", {})
 
     cmd = [
@@ -200,8 +200,8 @@ def run_claude(prompt: str, claude_opts: dict, model_override: str | None = None
 def run_codex(prompt: str, codex_cfg: dict, model_override: str | None = None) -> str:
     """Invoke Codex CLI and return response text."""
     cli_path = codex_cfg.get("cli_path", "codex")
-    model = model_override or codex_cfg.get("model", "gpt-5.5")
-    reasoning = codex_cfg.get("reasoning_effort", "xhigh")
+    model = model_override or codex_cfg.get("model", "gpt-6-astra")
+    reasoning = codex_cfg.get("reasoning_effort", "max")
 
     cmd = [
         cli_path,
@@ -210,6 +210,7 @@ def run_codex(prompt: str, codex_cfg: dict, model_override: str | None = None) -
         "-c", f'model_reasoning_effort="{reasoning}"',
         "exec",
         "--json",
+        "--skip-git-repo-check",
         "--dangerously-bypass-approvals-and-sandbox",
         "-C", os.getcwd(),
         prompt,
@@ -228,7 +229,7 @@ def run_codex(prompt: str, codex_cfg: dict, model_override: str | None = None) -
                 if item.get("type") == "agent_message":
                     response = item.get("text", "")
     except (json.JSONDecodeError, ValueError):
-        response = result.stdout.strip()
+        response = ""
 
     # Codex sometimes exits non-zero (warning) while still producing a valid
     # agent_message. Treat the response as authoritative.

@@ -2,7 +2,13 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PYTHON="$(conda run -n agent which python)"
+if [ -n "${QED_PYTHON:-}" ]; then
+    PYTHON="$QED_PYTHON"
+elif [ -x "$SCRIPT_DIR/.venv/bin/python" ]; then
+    PYTHON="$SCRIPT_DIR/.venv/bin/python"
+else
+    PYTHON="$(conda run -n agent which python)"
+fi
 
 PROBLEM_FILE="${1:-$SCRIPT_DIR/problem/problem.tex}"
 OUTPUT_DIR="${2:-$SCRIPT_DIR/proof_output}"
