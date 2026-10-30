@@ -27,7 +27,7 @@ import yaml
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from compat import decode_kwargs, read_text, resolve_cli, write_text  # noqa: E402
+from compat import decode_kwargs, read_text, resolve_cli, run_cli_async, write_text  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -445,18 +445,8 @@ async def run_agent(
         env = os.environ.copy()
         env.update(extra_env)
 
-    def _call():
-        return subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=cwd,
-            env=env,
-            **decode_kwargs(),
-        )
-
     try:
-        result = await asyncio.get_event_loop().run_in_executor(None, _call)
+        result = await run_cli_async(cmd, cwd=cwd, env=env)
     except Exception as exc:
         elapsed = (datetime.now() - start_time).total_seconds()
         if logger:

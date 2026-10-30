@@ -26,7 +26,13 @@ from process_manager import (
     is_alive,
     get_resume_options,
     prepare_resume,
+    install_cleanup_handlers,
 )
+
+# Ctrl+C (or closing the terminal) must stop the pipeline too: it runs
+# as a detached process tree and would otherwise keep calling the model
+# API after the UI is gone.
+install_cleanup_handlers()
 
 
 # ---------------------------------------------------------------------------
