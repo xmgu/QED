@@ -62,8 +62,8 @@ gemini:
 dsh:
   cli_path: "dsh"
   profile: "headless"
-  model: "deepseek-flash"  # deepseek-chat / deepseek-reasoner / deepseek-flash
-  provider: "deepseek-official"  # the harness' provider route for the model
+  model: "deepseek-v4-flash"  # model id exposed by the provider route
+  provider: "sufe"  # the harness' provider route for the model
   # What the agent may do: read-only | workspace-write | danger-full-access.
   # The proof agents need to write files in the output directory and run
   # shell commands, which is what "danger-full-access" allows.
