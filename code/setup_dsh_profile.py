@@ -88,6 +88,165 @@ def collect(source_entries: list) -> list:
     return picked
 
 
+# ---------------------------------------------------------------------------
+# Credential reference resolution
+# ---------------------------------------------------------------------------
+
+CREDENTIALS_FILE = os.path.join(DSH_HOME, ".credentials.yaml")
+
+
+def credential_refs() -> dict:
+    """Return the credential references stored in the credentials service."""
+    if not os.path.isfile(CREDENTIALS_FILE):
+        return {}
+    try:
+        with open(CREDENTIALS_FILE, encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except (OSError, yaml.YAMLError):
+        return {}
+    refs = data.get("refs") or {}
+    return refs if isinstance(refs, dict) else {}
+
+
+def resolve_api_key_env(env_name: str, refs: dict) -> str:
+    """Return a reference name the command line can actually resolve.
+
+    The desktop app can point a provider at a *key group* such as
+    ``KEYSMGR_SUFE_F3635D``: the ``dsh-keys-manager`` bundle expands it
+    into the individual keys it holds. That bundle ships with the
+    desktop profile only, so the command line -- which drives the
+    headless profile -- cannot resolve a group name and reports
+    ``MISSING_CREDENTIAL``.
+
+    The stored references are named after the individual keys
+    (``KEYSMGR_SUFE_F3635D_K_<hash>``), plus whatever plain aliases the
+    app has written (``SUFE_API_KEY``). So the group name is mapped onto
+    a reference that exists.
+
+    The name is returned unchanged when it already resolves.
+    """
+    if not env_name or env_name in refs:
+        return env_name
+
+    # A group name: KEYSMGR_<ROUTE>_F<hash>
+    if env_name.startswith("KEYSMGR_"):
+        prefix = env_name + "_K_"
+        members = [k for k in refs if k.startswith(prefix)]
+        if len(members) == 1:
+            return members[0]
+        if members:
+            # Several keys in the group: take the first one in a stable
+            # order so repeated runs use the same key.
+            return sorted(members)[0]
+        # The group is empty -- fall back to a plain alias if there is one.
+        aliases = [k for k in refs
+                   if k.startswith("KEYSMGR_") and "_K_" not in k]
+        if aliases:
+            return sorted(aliases)[0]
+
+    return env_name
+
+
+def group_members(group: str, refs: dict) -> list[str]:
+    """Return the individual key references that belong to *group*."""
+    prefix = group + "_K_"
+    members = sorted(k for k in refs if k.startswith(prefix))
+    if members:
+        return members
+    return [group] if group in refs else []
+
+
+def probe_key(profile: str, ref_name: str, entries: list) -> str | None:
+    """Probe the harness with *ref_name* and report what happened.
+
+    Returns ``"ok"`` when the request was accepted, ``"quota"`` when the
+    service refused it for lack of quota, and ``None`` when the probe
+    itself could not be carried out.
+    """
+    import subprocess
+    import sys
+
+    sys.path.insert(0, os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "code"))
+    try:
+        from compat import resolve_cli
+    except ImportError:
+        return None
+
+    cli = resolve_cli("dsh")
+    if not cli or not os.path.isfile(cli):
+        return None
+
+    original = load_patch(profile)
+    patched = []
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("id") == "llm-pi-ai":
+            entry = _with_api_key_env(entry, ref_name)
+        patched.append(entry)
+    write_patch(profile, patched)
+    try:
+        result = subprocess.run(
+            [cli, "--profile", profile, "--json"],
+            input="Hi", capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=90,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"  probe failed: {type(exc).__name__}: {exc}", flush=True)
+        return None
+    finally:
+        write_patch(profile, original)
+
+    output = (result.stdout or "") + (result.stderr or "")
+    if "insufficient_user_quota" in output:
+        return "quota"
+    if result.returncode == 0:
+        return "ok"
+    return None
+
+
+def _with_api_key_env(entry: dict, ref_name: str) -> dict:
+    """Return a copy of *entry* whose routes use *ref_name*."""
+    import copy
+
+    clone = copy.deepcopy(entry)
+    providers = (clone.get("config", {}) or {}).get("providers")
+    if isinstance(providers, dict):
+        for spec in providers.values():
+            if isinstance(spec, dict):
+                spec["apiKeyEnv"] = ref_name
+    return clone
+
+
+def usable_key(profile: str, env_name: str, refs: dict,
+               entries: list) -> str:
+    """Return the reference of a key that the route can actually use.
+
+    The desktop app rotates through the keys of a group, skipping the
+    ones that ran out of quota. The command line has no key manager, so
+    the keys are probed one by one here: a request is attempted with
+    each candidate until one is accepted.
+
+    The first candidate is returned when none can be verified -- the
+    harness then reports the underlying error, which is more useful than
+    a probe that hides it.
+    """
+    candidates = group_members(env_name, refs) or [env_name]
+    if len(candidates) == 1:
+        return candidates[0]
+
+    for candidate in candidates:
+        print(f"  trying {candidate} ...", flush=True)
+        outcome = probe_key(profile, candidate, entries)
+        if outcome == "ok":
+            print(f"  {candidate} works", flush=True)
+            return candidate
+        if outcome == "quota":
+            print(f"  {candidate} is out of quota", flush=True)
+        else:
+            print(f"  {candidate} could not be probed", flush=True)
+    return candidates[0]
+
+
 def build_credentials_entry() -> dict:
     """Return the entry that enables the local credentials plugin."""
     return {
@@ -149,6 +308,50 @@ def main() -> int:
         print(f"Profile {args.source!r} has no provider configuration "
               f"(looked for {', '.join(COPIED_PLUGIN_IDS)}).")
         return 1
+
+    # The desktop app may point a provider at a key group that only its
+    # own keys-manager bundle can expand. Map it onto a reference the
+    # command line can resolve, and pick a key that still has quota.
+    refs = credential_refs()
+
+    # The entries that will end up in the target profile -- the probe
+    # needs the complete set, because a profile without the credentials
+    # plugin cannot authenticate at all.
+    target_entries = load_patch(args.profile)
+    kept = [e for e in target_entries
+            if not (isinstance(e, dict) and e.get("id") in COPIED_PLUGIN_IDS)]
+    kept = [e for e in kept
+            if not (isinstance(e, dict) and e.get("id") == CREDENTIALS_PLUGIN_ID)]
+    probe_entries = picked + [build_credentials_entry()] + kept
+
+    rewritten = []
+    for entry in picked:
+        if entry.get("id") == "llm-pi-ai":
+            providers = (entry.get("config", {}) or {}).get("providers")
+            if isinstance(providers, dict):
+                for spec in providers.values():
+                    if not isinstance(spec, dict):
+                        continue
+                    env_name = spec.get("apiKeyEnv")
+                    if not env_name:
+                        continue
+                    resolved = resolve_api_key_env(env_name, refs)
+                    if resolved != env_name:
+                        print(f"apiKeyEnv {env_name!r} -> {resolved!r} "
+                              f"(the group name is only resolvable by the "
+                              f"desktop app's key manager)")
+                        spec["apiKeyEnv"] = resolved
+                    # The group holds several keys and the desktop app
+                    # rotates through them; pick one that still works.
+                    if len(group_members(env_name, refs)) > 1:
+                        chosen = usable_key(args.profile, env_name, refs,
+                                            probe_entries)
+                        if chosen != spec.get("apiKeyEnv"):
+                            print(f"using key {chosen!r} "
+                                  f"(the others are out of quota)")
+                            spec["apiKeyEnv"] = chosen
+        rewritten.append(entry)
+    picked = rewritten
 
     target_entries = load_patch(args.profile)
     # Drop the entries we are about to replace, keep everything else.
