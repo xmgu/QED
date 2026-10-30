@@ -325,6 +325,40 @@ def run_gemini(prompt: str, gemini_cfg: dict, model_override: str | None = None)
     return response
 
 
+def _write_dsh_model_patch(model: str, provider: str = "deepseek-official") -> str:
+    """Write a ``--patch`` file that selects *model* in the dsh profile.
+
+    The harness picks the model through the ``agent-default-model``
+    plugin of its profile, which no command-line flag reaches. A patch
+    file overlays one more configuration layer, so that is how a
+    per-agent model override is applied.
+
+    Both keys are required: the plugin's schema marks ``provider`` as
+    mandatory, and a patch that only sets ``model`` fails validation.
+    """
+    content = (
+        "- id: agent-default-model\n"
+        "  config:\n"
+        f"    provider: {provider}\n"
+        f"    model: {model}\n"
+    )
+    try:
+        fd, path = tempfile.mkstemp(prefix="qed-dsh-model-", suffix=".yml")
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(content)
+        return path
+    except OSError:
+        return ""
+
+
+def _remove_file(path: str) -> None:
+    """Delete a file, ignoring failures."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 def run_dsh(prompt: str, dsh_cfg: dict, model_override: str | None = None) -> str:
     """Invoke the DeepSeek Harness CLI and return the response text.
 
@@ -336,29 +370,42 @@ def run_dsh(prompt: str, dsh_cfg: dict, model_override: str | None = None) -> st
     """
     cli_path = resolve_cli(dsh_cfg.get("cli_path", "dsh"))
     profile = dsh_cfg.get("profile", "headless")
+    model = model_override or dsh_cfg.get("model", "")
+    provider = dsh_cfg.get("provider", "deepseek-official")
     api_key = dsh_cfg.get("api_key", "")
     permission_mode = dsh_cfg.get("permission_mode", "danger-full-access")
 
     cmd = [
         cli_path,
         "--profile", profile,
-        "--json",
     ]
+
+    # The harness resolves the model through its profile; a different
+    # model is requested by overlaying the agent-default-model plugin.
+    patch_path = ""
+    if model:
+        patch_path = _write_dsh_model_patch(model, provider)
+        if patch_path:
+            cmd += ["--patch", patch_path]
+    cmd.append("--json")
 
     env = os.environ.copy()
     if api_key:
         env["DEEPSEEK_API_KEY"] = api_key
     env["DSH_PERMISSION_MODE"] = permission_mode
 
-    result = subprocess.run(
-        cmd,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        env=env,
-        input=prompt,
-        **decode_kwargs(),
-    )
+    try:
+        result = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=env,
+            input=prompt,
+            **decode_kwargs(),
+        )
+    finally:
+        if patch_path:
+            _remove_file(patch_path)
 
     if result.returncode != 0:
         print(f"[DSH] Non-zero exit code: {result.returncode}", file=sys.stderr)

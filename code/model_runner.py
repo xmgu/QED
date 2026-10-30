@@ -597,6 +597,45 @@ async def run_gemini_agent(
 # DeepSeek Harness (dsh) wrapper
 # ---------------------------------------------------------------------------
 
+def _write_model_patch(model: str, provider: str = "deepseek-official") -> str:
+    """Write a ``--patch`` file that selects *model* in the dsh profile.
+
+    The harness picks the model through the ``agent-default-model``
+    plugin of its profile, which no command-line flag reaches. A patch
+    file is the documented way to overlay one more configuration layer,
+    so that is how a per-agent model override is applied.
+
+    Both keys are required: the plugin's schema marks ``provider`` as
+    mandatory, and a patch that only sets ``model`` fails validation.
+
+    Returns the patch file path, or ``""`` when it could not be written
+    (the harness then falls back to the profile's own model).
+    """
+    import tempfile
+
+    content = (
+        "- id: agent-default-model\n"
+        "  config:\n"
+        f"    provider: {provider}\n"
+        f"    model: {model}\n"
+    )
+    try:
+        fd, path = tempfile.mkstemp(prefix="qed-dsh-model-", suffix=".yml")
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+            f.write(content)
+        return path
+    except OSError:
+        return ""
+
+
+def _remove_file(path: str) -> None:
+    """Delete a file, ignoring failures."""
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
 async def run_dsh_agent(
     prompt: str,
     working_dir: str,
@@ -618,6 +657,11 @@ async def run_dsh_agent(
     The harness emits newline-delimited JSON events; the answer is the
     ``final`` event's ``text`` field.
 
+    The model is not a command-line flag: the harness picks it through
+    the ``agent-default-model`` plugin of its profile. Selecting a
+    different model therefore goes through ``--patch``, which overlays
+    one more configuration layer on top of the profile.
+
     Args:
         prompt: The full prompt string.
         working_dir: Directory the agent operates in (cwd for subprocess).
@@ -630,14 +674,23 @@ async def run_dsh_agent(
     cli_path = resolve_cli(dsh_config.get("cli_path", "dsh"))
     profile = dsh_config.get("profile", "headless")
     model = dsh_config.get("model", "deepseek-flash")
+    provider = dsh_config.get("provider", "deepseek-official")
     api_key = dsh_config.get("api_key", "")
     permission_mode = dsh_config.get("permission_mode", "danger-full-access")
 
     cmd = [
         cli_path,
         "--profile", profile,
-        "--json",
     ]
+
+    # The harness resolves the model through its profile, so a different
+    # model is requested by overlaying the agent-default-model plugin.
+    patch_path = ""
+    if model:
+        patch_path = _write_model_patch(model, provider)
+        if patch_path:
+            cmd += ["--patch", patch_path]
+    cmd.append("--json")
 
     def _call():
         env = os.environ.copy()
@@ -647,15 +700,19 @@ async def run_dsh_agent(
         # pipeline needs file read/write and shell access inside the
         # output directory, which is what "danger-full-access" grants.
         env["DSH_PERMISSION_MODE"] = permission_mode
-        return subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=working_dir,
-            env=env,
-            input=prompt,
-            **decode_kwargs(),
-        )
+        try:
+            return subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=working_dir,
+                env=env,
+                input=prompt,
+                **decode_kwargs(),
+            )
+        finally:
+            if patch_path:
+                _remove_file(patch_path)
 
     start = datetime.now()
     if logger:

@@ -215,6 +215,7 @@ dsh:
   cli_path: "dsh"
   profile: "headless"
   model: "deepseek-flash"
+  provider: "deepseek-official"
   permission_mode: "danger-full-access"
   api_key: ""  # or export DEEPSEEK_API_KEY
 ```
@@ -224,6 +225,22 @@ dsh:
 files in the output directory and run shell commands, which is what
 `danger-full-access` grants — the equivalent of Claude's
 `--dangerously-skip-permissions`.
+
+The model is not a command-line flag: the harness resolves it through the
+`agent-default-model` plugin of its profile, so QED selects a different
+model by overlaying that plugin with a `--patch` file. Both `provider` and
+`model` are required in the patch.
+
+**Credentials.** The harness needs a DeepSeek API key. Provide it either
+way:
+
+```powershell
+setx DEEPSEEK_API_KEY "sk-..."
+```
+
+or paste it into `dsh.api_key` in `config.yaml` (or into the *DeepSeek
+Harness (dsh)* block of the sidebar). Without a key the harness exits with
+`MISSING_CREDENTIAL` and the pipeline stops in its smoke test.
 
 ### Installation
 

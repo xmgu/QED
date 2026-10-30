@@ -584,7 +584,6 @@ async def run_smoke_test(config: dict, config_path: str | None = None) -> bool:
                     dsh_env["DSH_PERMISSION_MODE"] = dsh_permission
                     dsh_result = subprocess.run(
                         [resolve_cli(dsh_cli), "--profile", dsh_profile, "--json"],
-                        stdin=subprocess.PIPE,
                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                         input="Reply with exactly: SMOKE_TEST_OK",
                         timeout=180, env=dsh_env, **decode_kwargs(),
