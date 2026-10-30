@@ -214,8 +214,8 @@ Configure it in the `dsh:` section of `config.yaml`:
 dsh:
   cli_path: "dsh"
   profile: "headless"
-  model: "deepseek-flash"
-  provider: "deepseek-official"
+  model: "deepseek-v4-flash"    # a model id the provider route exposes
+  provider: "sufe"              # the harness' provider route for the model
   permission_mode: "danger-full-access"
   api_key: ""  # or export DEEPSEEK_API_KEY
 ```
@@ -231,11 +231,38 @@ The model is not a command-line flag: the harness resolves it through the
 model by overlaying that plugin with a `--patch` file. Both `provider` and
 `model` are required in the patch.
 
-**Credentials.** The harness needs a DeepSeek API key. Provide it either
-way:
+#### Setting up the profile
+
+The harness keeps its provider routes and credentials per profile, and the
+`headless` profile QED drives ships empty. The `desktop` profile — where
+the desktop app configures a third-party OpenAI-compatible endpoint — is
+locked to the Electron application and cannot be used from the command
+line. So the provider definition has to be copied over:
+
+```bash
+python code/setup_dsh_profile.py          # desktop -> headless
+python code/setup_dsh_profile.py --show   # print the current state
+```
+
+The script copies the `agent-default-model` and `llm-pi-ai` entries, and
+enables the local credentials plugin — it is disabled by default, so
+without that the CLI ignores `~/.dsh/.credentials.yaml` and reports
+`MISSING_CREDENTIAL` even though the key is stored there. The previous
+patch file is kept as `cordis.patch.yml.bak`.
+
+Check the result with:
+
+```bash
+echo "Reply with exactly: OK" | dsh --profile headless --json
+```
+
+**Credentials.** The harness needs an API key for the selected route. It
+reads it from the environment or from the credentials service
+(`~/.dsh/.credentials.yaml`), which the desktop app's *Models* page
+writes:
 
 ```powershell
-setx DEEPSEEK_API_KEY "sk-..."
+setx SUFE_API_KEY "sk-..."      # the apiKeyEnv of your route
 ```
 
 or paste it into `dsh.api_key` in `config.yaml` (or into the *DeepSeek
