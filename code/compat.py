@@ -465,15 +465,24 @@ async def run_cli_async(cmd: list[str], *, timeout: float | None = None,
             kwargs["cwd"] = cwd
         if env is not None:
             kwargs["env"] = env
-        if input_text is not None:
-            kwargs["input"] = input_text
         if timeout is not None:
             kwargs["timeout"] = timeout
+        if input_text is not None:
+            # The prompt goes through a pipe. Without one the child
+            # inherits this process' stdin and waits for input that never
+            # arrives, while communicate() silently drops what it was
+            # given -- the call then hangs until something else kills it.
+            kwargs["stdin"] = subprocess.PIPE
 
+        # ``Popen`` has no ``input`` parameter -- the prompt is written to
+        # the pipe by hand.
         proc = subprocess.Popen(cmd, **kwargs, **decode_kwargs())
         holder["process"] = proc
         try:
-            stdout, stderr = proc.communicate()
+            if input_text is not None:
+                stdout, stderr = proc.communicate(input=input_text)
+            else:
+                stdout, stderr = proc.communicate()
         except BaseException:
             # The wait was interrupted: do not leave the CLI running.
             _terminate(proc)

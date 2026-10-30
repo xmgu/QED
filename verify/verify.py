@@ -332,6 +332,7 @@ def _write_dsh_model_patch(model: str, provider: str = "deepseek-official") -> s
     """
     content = (
         "- id: agent-default-model\n"
+        '  name: "@deepseek-ai/dsh-agent-default-model"\n'
         "  config:\n"
         f"    provider: {provider}\n"
         f"    model: {model}\n"

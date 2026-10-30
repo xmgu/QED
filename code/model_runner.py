@@ -573,6 +573,11 @@ def _write_model_patch(model: str, provider: str = "deepseek-official") -> str:
     Both keys are required: the plugin's schema marks ``provider`` as
     mandatory, and a patch that only sets ``model`` fails validation.
 
+    The plugin's ``name`` is given as well. An entry that carries only
+    an ``id`` is matched by id, but the harness then waits for a
+    service the unnamed plugin never publishes -- and the run hangs
+    instead of failing.
+
     Returns the patch file path, or ``""`` when it could not be written
     (the harness then falls back to the profile's own model).
     """
@@ -580,6 +585,7 @@ def _write_model_patch(model: str, provider: str = "deepseek-official") -> str:
 
     content = (
         "- id: agent-default-model\n"
+        '  name: "@deepseek-ai/dsh-agent-default-model"\n'
         "  config:\n"
         f"    provider: {provider}\n"
         f"    model: {model}\n"

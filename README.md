@@ -250,6 +250,18 @@ without that the CLI ignores `~/.dsh/.credentials.yaml` and reports
 `MISSING_CREDENTIAL` even though the key is stored there. The previous
 patch file is kept as `cordis.patch.yml.bak`.
 
+Two details the script takes care of:
+
+* **Key groups.** The desktop app can point a provider at a *group* of
+  keys (`KEYSMGR_SUFE_F3635D`); the `dsh-keys-manager` bundle expands it
+  into the individual keys. That bundle is part of the desktop profile
+  only, so the command line cannot resolve a group name. The script maps
+  it onto a stored reference.
+* **Exhausted keys.** A group holds several keys and the desktop app
+  rotates through them, skipping the ones that ran out of quota. The
+  command line has no key manager, so the script probes the keys one by
+  one and selects one that still works.
+
 Check the result with:
 
 ```bash
@@ -268,6 +280,11 @@ setx SUFE_API_KEY "sk-..."      # the apiKeyEnv of your route
 or paste it into `dsh.api_key` in `config.yaml` (or into the *DeepSeek
 Harness (dsh)* block of the sidebar). Without a key the harness exits with
 `MISSING_CREDENTIAL` and the pipeline stops in its smoke test.
+
+Note that the provider reserves the maximum output up front, so a request
+can be refused with `insufficient_user_quota` even when the account has
+plenty of quota left over for the actual answer. Re-running
+`setup_dsh_profile.py` picks a key whose reservation fits.
 
 ### Installation
 
