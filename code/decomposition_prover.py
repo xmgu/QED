@@ -84,17 +84,90 @@ def parse_decomposition(yaml_content: str) -> dict:
 
     Extracts the YAML block from markdown code fences if present.
     """
-    # Try to extract YAML from code block
+    yaml_content = _extract_yaml_block(yaml_content)
+    try:
+        return yaml.safe_load(yaml_content)
+    except yaml.YAMLError as exc:
+        repaired = _repair_yaml_escapes(yaml_content)
+        if repaired == yaml_content:
+            raise
+        # LaTeX in a double-quoted scalar is the usual culprit: "\mathbb{E}"
+        # and "A\B" are not valid escape sequences. Try again with the
+        # offending backslashes doubled.
+        try:
+            return yaml.safe_load(repaired)
+        except yaml.YAMLError:
+            raise exc
+
+
+def _extract_yaml_block(yaml_content: str) -> str:
+    """Return the YAML document from a markdown code fence, if present."""
     if "```yaml" in yaml_content:
         start = yaml_content.find("```yaml") + 7
         end = yaml_content.find("```", start)
-        yaml_content = yaml_content[start:end].strip()
-    elif "```" in yaml_content:
+        return yaml_content[start:end].strip()
+    if "```" in yaml_content:
         start = yaml_content.find("```") + 3
         end = yaml_content.find("```", start)
-        yaml_content = yaml_content[start:end].strip()
+        return yaml_content[start:end].strip()
+    return yaml_content.strip()
 
-    return yaml.safe_load(yaml_content)
+
+#: The escape sequences YAML defines inside a double-quoted scalar.
+_YAML_ESCAPES = set('"\\/bfnrtv0abxeN_LP U')
+
+
+def _repair_yaml_escapes(text: str) -> str:
+    """Double the backslashes that YAML would reject inside a quoted scalar.
+
+    A double-quoted scalar treats ``\\`` as an escape, so a LaTeX
+    fragment such as ``\\mathbb{E}`` or ``A\\B`` does not parse. The
+    backslashes are doubled only inside double-quoted scalars, and only
+    where they do not already start a valid escape, so the rest of the
+    document is left untouched.
+    """
+    out = []
+    in_double = False
+    i = 0
+    n = len(text)
+
+    while i < n:
+        ch = text[i]
+
+        if in_double:
+            if ch == "\\" and i + 1 < n:
+                nxt = text[i + 1]
+                if nxt in _YAML_ESCAPES:
+                    out.append(ch)
+                    out.append(nxt)
+                    i += 2
+                    continue
+                # An invalid escape: double the backslash so the literal
+                # backslash survives into the parsed value.
+                out.append("\\\\")
+                i += 1
+                continue
+            if ch == '"':
+                in_double = False
+            out.append(ch)
+            i += 1
+            continue
+
+        if ch == '"':
+            in_double = True
+        elif ch == "#" and i > 0 and text[i - 1] in " \t":
+            # A comment runs to the end of the line; a double quote inside
+            # it does not open a scalar.
+            end = text.find("\n", i)
+            if end == -1:
+                end = n
+            out.append(text[i:end])
+            i = end
+            continue
+        out.append(ch)
+        i += 1
+
+    return "".join(out)
 
 
 def parse_verdict(response: str) -> str:
@@ -372,7 +445,7 @@ class DecompositionState:
         path = os.path.join(self.get_revision_dir(), "decomposition.yaml")
         content = read_file(path)
         if content:
-            self.decomposition = yaml.safe_load(content)
+            self.decomposition = parse_decomposition(content)
             return self.decomposition
         return None
 
@@ -574,7 +647,7 @@ def detect_decomposition_resume(output_dir: str) -> dict:
             if decomp_content:
                 last_proof = _find_max_numbered_dir(rev_dir, "proof_")
                 try:
-                    decomp = yaml.safe_load(decomp_content)
+                    decomp = parse_decomposition(decomp_content)
                 except yaml.YAMLError:
                     decomp = None  # Skip invalid YAML in history
                 attempt_history.append({
@@ -615,7 +688,7 @@ def detect_decomposition_resume(output_dir: str) -> dict:
         return result
 
     try:
-        decomposition = yaml.safe_load(decomp_content)
+        decomposition = parse_decomposition(decomp_content)
     except yaml.YAMLError:
         # Invalid YAML in current decomposition - need to re-decompose
         result["has_progress"] = len(attempt_history) > 0 or latest_revision > 1
