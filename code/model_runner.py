@@ -559,6 +559,185 @@ async def run_gemini_agent(
 
 
 # ---------------------------------------------------------------------------
+# DeepSeek Harness (dsh) wrapper
+# ---------------------------------------------------------------------------
+
+async def run_dsh_agent(
+    prompt: str,
+    working_dir: str,
+    dsh_config: dict,
+    logger=None,
+    tracker=None,
+    call_name: str = "",
+) -> str:
+    """Run the DeepSeek Harness CLI as a proof-search agent.
+
+    Returns the response text.
+
+    ``dsh`` is launched in its ``headless`` profile, which answers one
+    task and exits. The prompt is fed through stdin rather than as a
+    command-line argument: the rendered prompts reach 20-30 k characters
+    and Windows caps a command line at 32767, so passing them as argv
+    would fail there.
+
+    The harness emits newline-delimited JSON events; the answer is the
+    ``final`` event's ``text`` field.
+
+    Args:
+        prompt: The full prompt string.
+        working_dir: Directory the agent operates in (cwd for subprocess).
+        dsh_config: Dict with keys: cli_path, profile, model, api_key,
+            permission_mode.
+        logger: Optional PipelineLogger for streaming output.
+        tracker: Optional TokenTracker for recording token usage.
+        call_name: Human-readable label for this call.
+    """
+    cli_path = resolve_cli(dsh_config.get("cli_path", "dsh"))
+    profile = dsh_config.get("profile", "headless")
+    model = dsh_config.get("model", "deepseek-flash")
+    api_key = dsh_config.get("api_key", "")
+    permission_mode = dsh_config.get("permission_mode", "danger-full-access")
+
+    cmd = [
+        cli_path,
+        "--profile", profile,
+        "--json",
+    ]
+
+    def _call():
+        env = os.environ.copy()
+        if api_key:
+            env["DEEPSEEK_API_KEY"] = api_key
+        # The harness reads these to decide what the agent may do. The
+        # pipeline needs file read/write and shell access inside the
+        # output directory, which is what "danger-full-access" grants.
+        env["DSH_PERMISSION_MODE"] = permission_mode
+        return subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=working_dir,
+            env=env,
+            input=prompt,
+            **decode_kwargs(),
+        )
+
+    start = datetime.now()
+    if logger:
+        logger.log(f"[DSH] Starting {call_name} (model={model})")
+
+    try:
+        result = await asyncio.get_event_loop().run_in_executor(None, _call)
+    except Exception as exc:
+        elapsed = (datetime.now() - start).total_seconds()
+        if logger:
+            logger.log(f"[DSH] EXCEPTION: {type(exc).__name__}: {exc}")
+        if tracker:
+            tracker.record(call_name or "dsh", 0, 0, elapsed,
+                           provider="dsh", model=model)
+        raise ModelRunnerError(
+            provider="dsh",
+            error_type="subprocess_error",
+            message=f"Failed to execute dsh CLI: {type(exc).__name__}: {exc}",
+        )
+
+    elapsed = (datetime.now() - start).total_seconds()
+
+    if result.stderr and result.stderr.strip() and logger:
+        logger.log(f"[DSH] stderr:\n{result.stderr.strip()}")
+
+    # --- Parse the NDJSON event stream ---
+    response = ""
+    input_tokens = 0
+    output_tokens = 0
+    json_parse_error = None
+    events: list[dict] = []
+    saw_final = False
+
+    try:
+        for line in result.stdout.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                events.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+
+        for event in events:
+            event_type = event.get("type")
+            if event_type == "final":
+                saw_final = True
+                response = event.get("text", "") or ""
+            elif event_type == "usage":
+                usage = event.get("usage", event)
+                input_tokens += usage.get("input_tokens", 0)
+                output_tokens += usage.get("output_tokens", 0)
+            elif event_type == "assistant" and not response:
+                # Fall back to an assistant message when the harness did
+                # not emit a "final" event.
+                message = event.get("message", event)
+                content = message.get("content", "")
+                if isinstance(content, str):
+                    response = content
+                elif isinstance(content, list):
+                    parts = [b.get("text", "") for b in content
+                             if isinstance(b, dict) and b.get("type") == "text"]
+                    response = "".join(parts)
+    except (json.JSONDecodeError, ValueError) as exc:
+        json_parse_error = str(exc)
+        if logger:
+            logger.log(f"[DSH] JSON parse error: {exc}")
+
+    if not response.strip() and not saw_final and result.stdout.strip():
+        # The harness produced no recognisable event at all -- keep the
+        # raw output so nothing is lost. A "final" event with an empty
+        # body is a genuine failure and must not be masked this way.
+        response = result.stdout.strip()
+
+    if result.returncode != 0:
+        if logger:
+            logger.log(f"[DSH] Non-zero exit code: {result.returncode}")
+        if not response.strip():
+            if tracker:
+                tracker.record(call_name or "dsh", input_tokens, output_tokens,
+                               elapsed, provider="dsh", model=model)
+            raise ModelRunnerError(
+                provider="dsh",
+                error_type="non_zero_exit",
+                message=f"dsh CLI exited with code {result.returncode}",
+                exit_code=result.returncode,
+                stderr=result.stderr,
+                stdout=result.stdout,
+            )
+
+    if not response.strip():
+        if logger:
+            logger.log("[DSH] Empty response received")
+        if tracker:
+            tracker.record(call_name or "dsh", input_tokens, output_tokens,
+                           elapsed, provider="dsh", model=model)
+        raise ModelRunnerError(
+            provider="dsh",
+            error_type="empty_response",
+            message="dsh returned empty response" + (f" (JSON parse error: {json_parse_error})" if json_parse_error else ""),
+            exit_code=result.returncode,
+            stderr=result.stderr,
+            stdout=result.stdout,
+        )
+
+    if logger:
+        logger.log(f"[DSH] Completed {call_name} in {elapsed:.0f}s "
+                   f"({input_tokens} in / {output_tokens} out)")
+
+    if tracker:
+        tracker.record(call_name or "dsh", input_tokens, output_tokens,
+                       elapsed, provider="dsh", model=model)
+
+    return response
+
+
+# ---------------------------------------------------------------------------
 # Per-agent override resolution
 # ---------------------------------------------------------------------------
 
@@ -595,9 +774,10 @@ def resolve_agent_provider_config(
             f"Agent role config is missing required 'provider' field: {agent_role_cfg!r}"
         )
     provider = provider.lower().strip()
-    if provider not in ("claude", "codex", "gemini"):
+    if provider not in ("claude", "codex", "gemini", "dsh"):
         raise ValueError(
-            f"Unknown provider {provider!r}; expected 'claude', 'codex', or 'gemini'."
+            f"Unknown provider {provider!r}; expected 'claude', 'codex', "
+            f"'gemini', or 'dsh'."
         )
 
     overrides = {k: v for k, v in agent_role_cfg.items() if k != "provider"}
@@ -618,7 +798,7 @@ def resolve_agent_provider_config(
             merged[k] = v
         return provider, merged
 
-    # codex / gemini: flat dict merge
+    # codex / gemini / dsh: flat dict merge
     merged = {**global_section, **overrides}
     return provider, merged
 
@@ -671,9 +851,14 @@ async def run_model(
             prompt, working_dir, config.get("gemini", {}),
             logger=logger, tracker=tracker, call_name=call_name,
         )
+    elif provider == "dsh":
+        return await run_dsh_agent(
+            prompt, working_dir, config.get("dsh", {}),
+            logger=logger, tracker=tracker, call_name=call_name,
+        )
     else:
         raise ValueError(f"Unknown model provider: {provider!r}. "
-                         f"Expected 'claude', 'codex', or 'gemini'.")
+                         f"Expected 'claude', 'codex', 'gemini', or 'dsh'.")
 
 
 async def run_model_for_agent(

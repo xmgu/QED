@@ -13,6 +13,7 @@ from utils import (
     PIPELINE_AGENT_NAMES,
     CODEX_REASONING_LEVELS,
     GEMINI_THINKING_LEVELS,
+    DSH_PERMISSION_MODES,
 )
 
 
@@ -168,6 +169,45 @@ def _render_gemini_block(gemini_cfg: dict) -> dict:
     }
 
 
+def _render_dsh_block(dsh_cfg: dict) -> dict:
+    st.sidebar.subheader("DeepSeek Harness (dsh)")
+    dsh_model = st.sidebar.text_input(
+        "Model", value=dsh_cfg.get("model", "deepseek-flash"),
+        key="dsh_model",
+    )
+    dsh_api = st.sidebar.text_input(
+        "DeepSeek API key", value=dsh_cfg.get("api_key", ""),
+        type="password", key="dsh_api",
+    )
+    with st.sidebar.expander("dsh Advanced"):
+        dsh_cli = st.text_input(
+            "CLI path", value=dsh_cfg.get("cli_path", "dsh"),
+            key="dsh_cli",
+        )
+        dsh_profile = st.text_input(
+            "Profile", value=dsh_cfg.get("profile", "headless"),
+            key="dsh_profile",
+        )
+        dsh_permission = st.selectbox(
+            "Permission mode",
+            list(DSH_PERMISSION_MODES),
+            index=DSH_PERMISSION_MODES.index(
+                dsh_cfg.get("permission_mode", "danger-full-access")
+                if dsh_cfg.get("permission_mode", "danger-full-access")
+                in DSH_PERMISSION_MODES else "danger-full-access"
+            ),
+            key="dsh_permission",
+        )
+    return {
+        **dsh_cfg,
+        "cli_path": dsh_cli,
+        "profile": dsh_profile,
+        "model": dsh_model,
+        "permission_mode": dsh_permission,
+        "api_key": dsh_api,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Per-agent override blocks
 # ---------------------------------------------------------------------------
@@ -263,6 +303,7 @@ def render_config_panel() -> dict:
     claude_block = _render_claude_block(cfg.get("claude", {}))
     codex_block = _render_codex_block(cfg.get("codex", {}))
     gemini_block = _render_gemini_block(cfg.get("gemini", {}))
+    dsh_block = _render_dsh_block(cfg.get("dsh", {}))
 
     st.sidebar.caption("Prover mode: decomposition (only mode supported)")
 
@@ -307,6 +348,7 @@ def render_config_panel() -> dict:
     result["claude"] = claude_block
     result["codex"] = codex_block
     result["gemini"] = gemini_block
+    result["dsh"] = dsh_block
     result["prover"] = {"mode": "decomposition"}
     result["pipeline"] = {
         **{name: pipeline_agents[name] for name in PIPELINE_AGENT_NAMES},

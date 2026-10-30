@@ -124,9 +124,10 @@ def merge_provider_section(config: dict, role_cfg: dict) -> tuple[str, dict]:
     auth block (subscription/api_key/bedrock) ``claude.provider`` selects.
     """
     provider = role_cfg["provider"].lower().strip()
-    if provider not in ("claude", "codex", "gemini"):
+    if provider not in ("claude", "codex", "gemini", "dsh"):
         raise ValueError(
-            f"Unknown provider {provider!r}; expected 'claude', 'codex', or 'gemini'."
+            f"Unknown provider {provider!r}; expected 'claude', 'codex', "
+            f"'gemini', or 'dsh'."
         )
     overrides = {k: v for k, v in role_cfg.items() if k != "provider"}
     global_section = config.get(provider, {})
@@ -318,6 +319,71 @@ def run_gemini(prompt: str, gemini_cfg: dict, model_override: str | None = None)
     return response
 
 
+def run_dsh(prompt: str, dsh_cfg: dict, model_override: str | None = None) -> str:
+    """Invoke the DeepSeek Harness CLI and return the response text.
+
+    ``dsh`` runs its ``headless`` profile, which answers one task and
+    exits. The prompt goes in through stdin rather than as an argument:
+    the rendered prompts reach 20-30 k characters and Windows caps a
+    command line at 32767. The harness emits newline-delimited JSON
+    events; the answer is the ``final`` event's ``text``.
+    """
+    cli_path = resolve_cli(dsh_cfg.get("cli_path", "dsh"))
+    profile = dsh_cfg.get("profile", "headless")
+    api_key = dsh_cfg.get("api_key", "")
+    permission_mode = dsh_cfg.get("permission_mode", "danger-full-access")
+
+    cmd = [
+        cli_path,
+        "--profile", profile,
+        "--json",
+    ]
+
+    env = os.environ.copy()
+    if api_key:
+        env["DEEPSEEK_API_KEY"] = api_key
+    env["DSH_PERMISSION_MODE"] = permission_mode
+
+    result = subprocess.run(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        env=env,
+        input=prompt,
+        **decode_kwargs(),
+    )
+
+    if result.returncode != 0:
+        print(f"[DSH] Non-zero exit code: {result.returncode}", file=sys.stderr)
+        if result.stderr.strip():
+            print(f"[DSH] stderr: {result.stderr.strip()[:500]}", file=sys.stderr)
+
+    response = ""
+    saw_final = False
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "final":
+            saw_final = True
+            response = event.get("text", "") or ""
+
+    if not response.strip() and not saw_final and result.stdout.strip():
+        # No recognisable event at all -- keep the raw output. A "final"
+        # event with an empty body is a genuine failure and is not masked.
+        response = result.stdout.strip()
+
+    if not response.strip():
+        raise RuntimeError(f"dsh returned empty response. "
+                           f"Exit code: {result.returncode}")
+    return response
+
+
 def run_model_for_role(role_cfg: dict, prompt: str, config: dict) -> str:
     """Dispatch a prompt using a per-agent role config dict.
 
@@ -335,9 +401,11 @@ def run_model_for_role(role_cfg: dict, prompt: str, config: dict) -> str:
         return run_codex(prompt, merged_section, model_override)
     elif provider == "gemini":
         return run_gemini(prompt, merged_section, model_override)
+    elif provider == "dsh":
+        return run_dsh(prompt, merged_section, model_override)
     else:
         raise ValueError(f"Unknown provider: {provider!r}. "
-                         f"Expected 'claude', 'codex', or 'gemini'.")
+                         f"Expected 'claude', 'codex', 'gemini', or 'dsh'.")
 
 
 # ---------------------------------------------------------------------------
@@ -564,7 +632,7 @@ def main():
     parser.add_argument("-o", "--output", default=None,
                         help="Write report to file (default: stdout)")
     parser.add_argument("--provider", default=None,
-                        choices=["claude", "codex", "gemini"],
+                        choices=["claude", "codex", "gemini", "dsh"],
                         help="Override all agents to one provider")
     parser.add_argument("-m", "--model", default=None,
                         help="Override model name for all agents")

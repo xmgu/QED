@@ -55,6 +55,21 @@ gemini:
   api_key: ""  # paste your Google Gemini API key here, leave empty if Gemini CLI is already logged in with subscription
 
 
+# --- DeepSeek Harness (dsh) ---
+# The harness runs one task per invocation in its "headless" profile and
+# exits. The prompt is passed through stdin, so there is no command-line
+# length limit.
+dsh:
+  cli_path: "dsh"
+  profile: "headless"
+  model: "deepseek-flash"  # deepseek-chat / deepseek-reasoner / deepseek-flash
+  # What the agent may do: read-only | workspace-write | danger-full-access.
+  # The proof agents need to write files in the output directory and run
+  # shell commands, which is what "danger-full-access" allows.
+  permission_mode: "danger-full-access"
+  api_key: ""  # paste your DeepSeek API key here; the harness also reads DEEPSEEK_API_KEY from the environment
+
+
 
 
 # =============================================================================

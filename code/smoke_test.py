@@ -275,7 +275,7 @@ async def run_smoke_test(config: dict, config_path: str | None = None) -> bool:
         if prov:
             providers_in_use.add(prov)
 
-    providers_in_use = {p for p in providers_in_use if p in {"claude", "codex", "gemini"}}
+    providers_in_use = {p for p in providers_in_use if p in {"claude", "codex", "gemini", "dsh"}}
 
     # -------------------------------------------------------
     # Test 5: Claude CLI connectivity (provider-aware)
@@ -392,7 +392,7 @@ async def run_smoke_test(config: dict, config_path: str | None = None) -> bool:
     check("decomposition config present", bool(decomp_cfg),
           "Missing decomposition config")
 
-    valid_providers = {"claude", "codex", "gemini"}
+    valid_providers = {"claude", "codex", "gemini", "dsh"}
 
     def _validate_role(label: str, role_cfg) -> None:
         if not isinstance(role_cfg, dict):
@@ -567,6 +567,55 @@ async def run_smoke_test(config: dict, config_path: str | None = None) -> bool:
             else:
                 check(f"Gemini CLI '{gemini_cli}' found", False,
                       "Install gemini or switch decomposition.models.* away from gemini")
+
+        # --- DeepSeek Harness ---
+        if "dsh" in providers_to_test:
+            dsh_cfg = config.get("dsh", {})
+            dsh_cli = dsh_cfg.get("cli_path", "dsh")
+            if shutil.which(dsh_cli) is not None:
+                try:
+                    dsh_profile = dsh_cfg.get("profile", "headless")
+                    dsh_permission = dsh_cfg.get("permission_mode",
+                                                 "danger-full-access")
+                    dsh_env = os.environ.copy()
+                    dsh_api_key = dsh_cfg.get("api_key", "")
+                    if dsh_api_key:
+                        dsh_env["DEEPSEEK_API_KEY"] = dsh_api_key
+                    dsh_env["DSH_PERMISSION_MODE"] = dsh_permission
+                    dsh_result = subprocess.run(
+                        [resolve_cli(dsh_cli), "--profile", dsh_profile, "--json"],
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                        input="Reply with exactly: SMOKE_TEST_OK",
+                        timeout=180, env=dsh_env, **decode_kwargs(),
+                    )
+                    dsh_resp = ""
+                    dsh_events = []
+                    for line in dsh_result.stdout.splitlines():
+                        if not line.strip():
+                            continue
+                        try:
+                            event = _json_test.loads(line)
+                        except _json_test.JSONDecodeError:
+                            continue
+                        dsh_events.append(event)
+                        if event.get("type") == "final":
+                            dsh_resp = (event.get("text", "") or "").strip()
+                    check("dsh CLI exits cleanly", dsh_result.returncode == 0,
+                          f"Exit code {dsh_result.returncode}, stderr: {dsh_result.stderr[:300]}")
+                    check("dsh responds", len(dsh_resp) > 0,
+                          f"Empty response, stdout: {dsh_result.stdout[:200]}")
+                    check("dsh response valid",
+                          dsh_resp == "SMOKE_TEST_OK",
+                          f"Got: {dsh_resp[:100]}")
+                except subprocess.TimeoutExpired:
+                    check("dsh connectivity", False, "Timed out after 180s")
+                except Exception as e:
+                    check("dsh connectivity", False, str(e))
+            else:
+                check(f"dsh CLI '{dsh_cli}' found", False,
+                      "Install the DeepSeek Harness CLI or switch "
+                      "decomposition.models.* away from dsh")
     else:
         print("\n=== Test 8: Non-Claude provider connectivity [SKIPPED — no non-Claude providers enabled] ===")
 
