@@ -178,8 +178,9 @@ The pipeline runs in three stages: literature survey (Stage 0), the decompositio
 | [Claude CLI](https://code.claude.com/docs/en/setup) | LLM backend | `curl -fsSL https://claude.ai/install.sh \| bash` (macOS/Linux/WSL) |
 | [Codex CLI](https://github.com/openai/codex) | LLM backend | `npm install -g @openai/codex` |
 | [Gemini CLI](https://github.com/google-gemini/gemini-cli) | LLM backend | `npm install -g @google/gemini-cli` |
+| [DeepSeek Harness](https://github.com/deepseek-ai) (`dsh`) | LLM backend | install the DeepSeek Harness CLI |
 
-You need at least one model CLI installed. Install only the ones you plan to use — every agent role in `config.yaml` can be set to `"claude"`, `"codex"`, or `"gemini"`.
+You need at least one model CLI installed. Install only the ones you plan to use — every agent role in `config.yaml` can be set to `"claude"`, `"codex"`, `"gemini"`, or `"dsh"`.
 
 The configuration prioritizes capability for mathematical proof search. Model selections were checked against official documentation on **September 22, 2026**:
 
@@ -188,8 +189,41 @@ The configuration prioritizes capability for mathematical proof search. Model se
 | Codex | [GPT-6 Astra](https://developers.openai.com/api/docs/models/gpt-6-astra) (`gpt-6-astra`), OpenAI's most capable model | `max` |
 | Claude | [Claude Fable 5.1](https://platform.claude.com/docs/en/models/fable-5-1/overview) (`claude-fable-5-1`), Anthropic's choice for the most demanding reasoning | Adaptive thinking; use `CLAUDE_CODE_EFFORT_LEVEL=max` for maximum effort |
 | Gemini | [Gemini 3.1 Pro Preview](https://ai.google.dev/gemini-api/docs/models/gemini-3.1-pro-preview) (`gemini-3.1-pro-preview`), selected for complex reasoning | `HIGH` for API access; CLI/model defaults for saved Google login (see subscription track) |
+| DeepSeek Harness | `deepseek-flash` (default), `deepseek-chat`, `deepseek-reasoner` | The harness picks the model through its own profile; the `dsh:` section sets the default |
 
-All shipped agent roles use Codex and inherit its global model and reasoning setting. Change an agent's `provider` to use Claude or Gemini. These are provider-specific choices for this workflow, not a measured ranking on QED's problems. Fable 5.1 requires [Claude Code 2.1.257 or later](https://code.claude.com/docs/en/model-config).
+All shipped agent roles use Codex and inherit its global model and reasoning setting. Change an agent's `provider` to use Claude, Gemini or dsh. These are provider-specific choices for this workflow, not a measured ranking on QED's problems. Fable 5.1 requires [Claude Code 2.1.257 or later](https://code.claude.com/docs/en/model-config).
+
+### DeepSeek Harness (`dsh`)
+
+QED drives the DeepSeek Harness through its `headless` profile, which answers
+one task and exits:
+
+```bash
+dsh --profile headless --json
+```
+
+The prompt is passed through **stdin** rather than as a command-line
+argument, so there is no length limit on the rendered prompts (they reach
+20-30 k characters, which exceeds the Windows command-line cap of 32767).
+The harness answers with newline-delimited JSON events; QED reads the
+`final` event.
+
+Configure it in the `dsh:` section of `config.yaml`:
+
+```yaml
+dsh:
+  cli_path: "dsh"
+  profile: "headless"
+  model: "deepseek-flash"
+  permission_mode: "danger-full-access"
+  api_key: ""  # or export DEEPSEEK_API_KEY
+```
+
+`permission_mode` maps to the harness's own presets: `read-only`,
+`workspace-write`, or `danger-full-access`. The proof agents need to write
+files in the output directory and run shell commands, which is what
+`danger-full-access` grants — the equivalent of Claude's
+`--dangerously-skip-permissions`.
 
 ### Installation
 
@@ -591,7 +625,7 @@ After completing either track, run the [Runtime Checks](#runtime-checks), then u
 
 ### Per-Agent Model Selection
 
-Every agent role is configured as a dict with at least a `provider` field. Any other field overrides the corresponding knob from the global `claude:` / `codex:` / `gemini:` section for that one agent. Knobs you don't set fall back to the global section.
+Every agent role is configured as a dict with at least a `provider` field. Any other field overrides the corresponding knob from the global `claude:` / `codex:` / `gemini:` / `dsh:` section for that one agent. Knobs you don't set fall back to the global section.
 
 ```yaml
 decomposition:
@@ -610,12 +644,16 @@ decomposition:
       model: "gemini-3.1-pro-preview"
       thinking_level: "HIGH"        # API track only; omit for saved Google login
 
+    verdict:
+      provider: "dsh"
+      model: "deepseek-reasoner"    # overrides global dsh.model
+
     # Falls back entirely to global codex defaults
     structural_verifier:
       provider: "codex"
 ```
 
-The override knobs are provider-specific: `model` for all three; `reasoning_effort` for Codex; `thinking_level` / `thinking_budget` for Gemini. For Claude, the **auth mode** (subscription / api_key / bedrock) stays global (controlled by `claude.provider`); only the `model` string can be overridden per agent.
+The override knobs are provider-specific: `model` for all four; `reasoning_effort` for Codex; `thinking_level` / `thinking_budget` for Gemini. For Claude, the **auth mode** (subscription / api_key / bedrock) stays global (controlled by `claude.provider`); only the `model` string can be overridden per agent. For dsh, `model` and `profile` can be overridden per agent; `permission_mode` stays global.
 
 The same dict shape applies to:
 
@@ -678,11 +716,12 @@ The proof search agent is required to use two tag formats that the verifier chec
 
 ### How Models are Called
 
-No agent framework is used. All model calls are bash subprocesses:
+No agent framework is used. All model calls are subprocesses:
 
 - **Claude:** `claude -p --output-format json --model <model> <prompt>`
 - **Codex:** `codex --search -m <model> exec --json -C <dir> <prompt>`
 - **Gemini:** `gemini -m <model> -o json -p <prompt>`
+- **DeepSeek Harness:** `dsh --profile headless --json`, with the prompt on stdin
 
 Each call is wrapped in `asyncio.run_in_executor` so the event loop stays non-blocking. Token usage from each call is parsed from JSON stdout and tracked in `TOKEN_USAGE.md` and `token_usage.json`.
 

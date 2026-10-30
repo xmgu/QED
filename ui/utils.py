@@ -28,7 +28,7 @@ ORIGINAL_CONFIG_PATH = os.path.join(PROJECT_ROOT, "config.yaml")
 GLOBAL_PROVE_HH = os.path.join(HUMAN_HELP_DIR, "additional_prove_human_help_global.md")
 GLOBAL_VERIFY_HH = os.path.join(HUMAN_HELP_DIR, "additional_verify_rule_global.md")
 
-MODEL_PROVIDERS = ("claude", "codex", "gemini")
+MODEL_PROVIDERS = ("claude", "codex", "gemini", "dsh")
 
 DECOMP_DIR_NAME = "decomposition"
 
@@ -47,6 +47,11 @@ PIPELINE_AGENT_NAMES = ("literature_survey", "proof_summary")
 
 CODEX_REASONING_LEVELS = ("max", "xhigh", "high", "medium", "low")
 GEMINI_THINKING_LEVELS = ("HIGH", "MEDIUM", "LOW", "NONE")
+
+# What the dsh agent may do. The proof agents need to write files in the
+# output directory and run shell commands, which requires the most
+# permissive mode.
+DSH_PERMISSION_MODES = ("read-only", "workspace-write", "danger-full-access")
 
 
 # ---------------------------------------------------------------------------
