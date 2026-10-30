@@ -35,14 +35,14 @@ You are operating in **{mode}** mode:
 Every intermediate step must be a **rigorous quantitative mathematical statement**, not a vague description.
 
 **BAD (descriptive):**
-- "The random variable X has a thin tail"
-- "The function f grows slowly"
-- "The sequence converges quickly"
+- The random variable X has a thin tail
+- The function f grows slowly
+- The sequence converges quickly
 
 **GOOD (quantitative):**
-- "For all t > 0, E[e^{{tX}}] ≤ e^{{t²σ²/2}}"
-- "For all x > 1, f(x) ≤ C log(x) where C = 3.5"
-- "For all n ≥ 1, |a_n - L| ≤ 2^{{-n}}"
+- For all t > 0, E[e^{{tX}}] ≤ e^{{t²σ²/2}}
+- For all x > 1, f(x) ≤ C log(x) where C = 3.5
+- For all n ≥ 1, |a_n - L| ≤ 2^{{-n}}
 
 If your initial intuition is descriptive, you MUST refine it to an explicit quantitative form before including it in the decomposition.
 
@@ -227,12 +227,22 @@ key_steps: [STEP2]  # List of key step IDs
 self_critique:
   plausibility_issues: []  # List any concerns about plausibility
   contradiction_checks:
-    - "Verified STEP2 does not contradict Theorem X from literature"
+    - |
+      Verified STEP2 does not contradict Theorem X from literature
   refinements_made:
-    - "Refined initial 'thin tail' intuition to explicit MGF bound"
+    - |
+      Refined initial 'thin tail' intuition to explicit MGF bound
   difficulty_assessment: |
     [Assessment of overall difficulty and which steps are hardest]
 ```
+
+> **Write every free-text field as a block scalar** (`- |` on its own
+> line, text indented underneath) or as a plain unquoted scalar. Do
+> **not** wrap free text in double quotes. Inside a double-quoted YAML
+> scalar a backslash starts an escape, so LaTeX breaks the document:
+> `"{{\mathbb{{E}}}}"` fails with *"found unknown escape character"*,
+> and so does `"A\B"`. A block scalar carries the text through
+> unchanged.
 
 ---
 
