@@ -221,10 +221,21 @@ dsh:
 ```
 
 `permission_mode` maps to the harness's own presets: `read-only`,
-`workspace-write`, or `danger-full-access`. The proof agents need to write
-files in the output directory and run shell commands, which is what
-`danger-full-access` grants — the equivalent of Claude's
-`--dangerously-skip-permissions`.
+`workspace-write`, or `danger-full-access`. It decides two things: the
+sandbox the agent runs in, and whether the agent has to ask before going
+beyond it (`ask` for the first two, `never` for the last).
+
+`workspace-write` is enough for the proof agents: they write their
+decomposition and proof files into the output directory and run shell
+commands, and the measured behaviour is the same as with unrestricted
+access. `read-only` is not — the agent cannot write its output at all.
+
+Note that on Windows the sandbox does not enforce the workspace boundary:
+an agent running under `workspace-write` was still able to write outside
+it. Only `read-only` is a real restriction there.
+
+On Windows the harness has no bash tool (`tool-bash` is disabled for
+`win32`); the agent uses PowerShell instead.
 
 The model is not a command-line flag: the harness resolves it through the
 `agent-default-model` plugin of its profile, so QED selects a different
