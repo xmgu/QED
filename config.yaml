@@ -65,9 +65,10 @@ dsh:
   model: "deepseek-v4-flash"  # model id exposed by the provider route
   provider: "sufe"  # the harness' provider route for the model
   # What the agent may do: read-only | workspace-write | danger-full-access.
-  # The proof agents need to write files in the output directory and run
-  # shell commands, which is what "danger-full-access" allows.
-  permission_mode: "danger-full-access"
+  # "workspace-write" lets the proof agents write the files they produce
+  # (decomposition.yaml, proof.md, ...) and run shell commands, without
+  # the unrestricted access that "danger-full-access" grants.
+  permission_mode: "workspace-write"
   api_key: ""  # paste your DeepSeek API key here; the harness also reads DEEPSEEK_API_KEY from the environment
 
 
