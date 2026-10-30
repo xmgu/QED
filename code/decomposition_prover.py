@@ -25,6 +25,7 @@ from pathlib import Path
 from typing import Any
 
 from model_runner import run_model, run_model_for_agent, run_claude_agent, ModelRunnerError
+from compat import read_text, write_text
 
 
 # ---------------------------------------------------------------------------
@@ -59,25 +60,23 @@ def load_prompt(prompts_dir: str, name: str, **kwargs) -> str:
     examples) are correctly unescaped to ``{...}`` in the rendered prompt.
     """
     path = os.path.join(prompts_dir, name)
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         template = f.read()
     return template.format(**kwargs)
 
 
 def read_file(path: str) -> str:
-    """Read file contents, return empty string if not found."""
-    try:
-        with open(path) as f:
-            return f.read()
-    except FileNotFoundError:
-        return ""
+    """Read file contents, return empty string if not found.
+
+    Lenient decoding: the files read here are produced by the agents and
+    may carry the locale code page rather than UTF-8.
+    """
+    return read_text(path)
 
 
 def write_file(path: str, content: str) -> None:
     """Write content to file, creating directories as needed."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
-        f.write(content)
+    write_text(path, content)
 
 
 def parse_decomposition(yaml_content: str) -> dict:
@@ -211,7 +210,7 @@ class DecompositionLogger:
         log_line = f"[{timestamp}] {message}\n"
 
         # Write to main log
-        with open(self.main_log_file, "a") as f:
+        with open(self.main_log_file, "a", encoding="utf-8") as f:
             f.write(log_line)
 
         # Print to console
@@ -354,7 +353,7 @@ class DecompositionState:
             "directly at `decomposition/attempt_*/revision_*/decomposition.yaml`.\n\n"
             "---\n"
         )
-        with open(path, "w") as f:
+        with open(path, "w", encoding="utf-8") as f:
             f.write(preamble)
 
     def save_decomposition(self, decomposition: dict) -> None:

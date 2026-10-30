@@ -25,6 +25,10 @@ from datetime import datetime
 
 import yaml
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from compat import decode_kwargs, read_text, resolve_cli, write_text  # noqa: E402
+
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -33,7 +37,7 @@ import yaml
 def load_prompt(prompts_dir: str, name: str, **kwargs) -> str:
     """Load a prompt template and fill placeholders."""
     path = os.path.join(prompts_dir, name)
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         template = f.read()
     return template.format(**kwargs)
 
@@ -100,8 +104,7 @@ def _file_nonempty(path: str) -> bool:
     """Return True if *path* exists and has non-whitespace content."""
     if not os.path.exists(path):
         return False
-    with open(path) as f:
-        return bool(f.read().strip())
+    return bool(read_text(path).strip())
 
 
 def _check_expected_files(
@@ -149,7 +152,7 @@ def _fallback_save_response(
     for path in primary_files:
         if not os.path.exists(path) and response.strip():
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "w") as f:
+            with open(path, "w", encoding="utf-8") as f:
                 f.write(response)
             fallback_used.append(path)
             if logger:
@@ -166,13 +169,13 @@ def _fallback_save_response(
         notice += f"\nThe content may not be properly formatted for this file.\n"
         for path in error_files:
             os.makedirs(os.path.dirname(path), exist_ok=True)
-            with open(path, "a") as f:
+            with open(path, "a", encoding="utf-8") as f:
                 f.write(notice)
     else:
         for path in error_files:
             if not os.path.exists(path):
                 os.makedirs(os.path.dirname(path), exist_ok=True)
-                with open(path, "w") as f:
+                with open(path, "w", encoding="utf-8") as f:
                     f.write("")
 
 
@@ -185,7 +188,7 @@ def _parse_difficulty(output_dir: str) -> str:
     path = os.path.join(output_dir, "related_info", "difficulty_evaluation.md")
     if not os.path.exists(path):
         return "unknown"
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         for line in f:
             if "classification" in line.lower():
                 upper = line.upper()
@@ -238,9 +241,8 @@ class PipelineLogger:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         history = ""
         if os.path.exists(self.history_file):
-            with open(self.history_file) as f:
-                history = f.read()
-        with open(self.status_file, "w") as f:
+            history = read_text(self.history_file)
+        with open(self.status_file, "w", encoding="utf-8") as f:
             f.write(f"# {self.phase} - Auto Status\n\n")
             f.write("| Field | Value |\n|-------|-------|\n")
             f.write(f"| **Status** | {state} |\n")
@@ -254,12 +256,12 @@ class PipelineLogger:
 
     def append_history(self, msg: str):
         now = datetime.now().strftime("%H:%M:%S")
-        with open(self.history_file, "a") as f:
+        with open(self.history_file, "a", encoding="utf-8") as f:
             f.write(f"- [{now}] {msg}\n")
 
     def log(self, msg: str):
         print(msg)
-        with open(self.log_file, "a") as f:
+        with open(self.log_file, "a", encoding="utf-8") as f:
             f.write(msg + "\n")
 
     def finalize(self, iteration: int, max_iter: int, exit_state: str, details: str):
@@ -379,7 +381,7 @@ class TokenTracker:
                 )
         lines.append("")
 
-        with open(self.md_path, "w") as f:
+        with open(self.md_path, "w", encoding="utf-8") as f:
             f.write("\n".join(lines))
 
         # --- JSON ---
@@ -394,7 +396,7 @@ class TokenTracker:
             "per_provider": self.per_provider,
             "calls": self.calls,
         }
-        with open(self.json_path, "w") as f:
+        with open(self.json_path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
 
 
@@ -417,7 +419,7 @@ async def run_agent(
     token usage. The agent runs in the working directory specified by
     ``claude_opts["cwd"]`` and has full tool access (file read/write, bash).
     """
-    cli_path = claude_opts.get("cli_path", "claude")
+    cli_path = resolve_cli(claude_opts.get("cli_path", "claude"))
     model = claude_opts.get("model", "claude-fable-5-1")
     cwd = claude_opts.get("cwd", ".")
     extra_env = claude_opts.get("env", {})
@@ -448,9 +450,9 @@ async def run_agent(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
             cwd=cwd,
             env=env,
+            **decode_kwargs(),
         )
 
     try:
@@ -667,7 +669,7 @@ async def main():
     parser.add_argument("--config", required=True, help="Path to config.yaml")
     args = parser.parse_args()
 
-    with open(args.config) as f:
+    with open(args.config, encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
     check_prerequisites(config)
@@ -697,7 +699,7 @@ async def main():
     math_skill_path = os.path.join(skill_dir, "super_math_skill.md")
     proving_skill = ""
     if os.path.exists(math_skill_path):
-        with open(math_skill_path) as f:
+        with open(math_skill_path, encoding="utf-8") as f:
             proving_skill = f.read()
 
     os.makedirs(output_dir, exist_ok=True)
@@ -740,7 +742,7 @@ async def main():
         print(f"  ({path})")
         print("=" * 60)
         if os.path.exists(path):
-            with open(path) as fh:
+            with open(path, encoding="utf-8") as fh:
                 content = fh.read()
             print(content if content.strip() else "(empty)")
         else:

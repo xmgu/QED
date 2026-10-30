@@ -17,6 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from pipeline import load_prompt, make_claude_options
 from decomposition_prover import load_prompt as decomp_load_prompt
+from compat import decode_kwargs, resolve_cli
 
 
 async def run_smoke_test(config: dict, config_path: str | None = None) -> bool:
@@ -241,7 +242,7 @@ async def run_smoke_test(config: dict, config_path: str | None = None) -> bool:
     print("\n=== Test 4: Skill loading ===")
     math_skill_path = os.path.join(skill_dir, "super_math_skill.md")
     try:
-        with open(math_skill_path) as f:
+        with open(math_skill_path, encoding="utf-8") as f:
             math_skill = f.read()
         check("Math skill loads", len(math_skill) > 100)
     except Exception as e:
@@ -295,7 +296,7 @@ async def run_smoke_test(config: dict, config_path: str | None = None) -> bool:
     if run_claude_test and os.path.exists(cli_settings_path):
         import json as _json_settings
         try:
-            with open(cli_settings_path) as _sf:
+            with open(cli_settings_path, encoding="utf-8") as _sf:
                 cli_settings = _json_settings.load(_sf)
             settings_env = cli_settings.get("env", {})
             if provider == "subscription" and settings_env.get("CLAUDE_CODE_USE_BEDROCK"):
@@ -349,11 +350,11 @@ async def run_smoke_test(config: dict, config_path: str | None = None) -> bool:
             model = opts["model"]
             try:
                 result = subprocess.run(
-                    [cli_path, "-p", "--output-format", "json",
+                    [resolve_cli(cli_path), "-p", "--output-format", "json",
                      "--model", model,
                      "Reply with exactly: SMOKE_TEST_OK"],
                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                    env=clean_env, text=True, timeout=60,
+                    env=clean_env, timeout=60, **decode_kwargs(),
                 )
                 data = json.loads(result.stdout)
                 text = data.get("result", "")
@@ -456,7 +457,7 @@ async def run_smoke_test(config: dict, config_path: str | None = None) -> bool:
                     # check reflects how Codex behaves at runtime.
                     with tempfile.TemporaryDirectory(prefix="qed-codex-smoke-") as codex_cwd:
                         codex_result = subprocess.run(
-                            [codex_cli, "--search", "-m", codex_model,
+                            [resolve_cli(codex_cli), "--search", "-m", codex_model,
                              "-c", f'model_reasoning_effort="{codex_reasoning}"',
                              "exec", "--json",
                              "--skip-git-repo-check",
@@ -464,7 +465,7 @@ async def run_smoke_test(config: dict, config_path: str | None = None) -> bool:
                              "-C", codex_cwd,
                              "Reply with exactly: SMOKE_TEST_OK"],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, timeout=120, cwd=codex_cwd,
+                            timeout=120, cwd=codex_cwd, **decode_kwargs(),
                         )
                     codex_resp = ""
                     for line in codex_result.stdout.splitlines():
@@ -537,17 +538,17 @@ async def run_smoke_test(config: dict, config_path: str | None = None) -> bool:
                                 json.dump(settings, f)
                             gemini_env["GEMINI_CLI_HOME"] = gemini_home
                             gemini_result = subprocess.run(
-                                [gemini_cli, "-m", gemini_model, "--approval-mode", gemini_approval_mode, "-o", "json",
+                                [resolve_cli(gemini_cli), "-m", gemini_model, "--approval-mode", gemini_approval_mode, "-o", "json",
                                  "-p", "Reply with exactly: SMOKE_TEST_OK"],
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                text=True, timeout=120, env=gemini_env,
+                                timeout=120, env=gemini_env, **decode_kwargs(),
                             )
                     else:
                         gemini_result = subprocess.run(
-                            [gemini_cli, "-m", gemini_model, "--approval-mode", gemini_approval_mode, "-o", "json",
+                            [resolve_cli(gemini_cli), "-m", gemini_model, "--approval-mode", gemini_approval_mode, "-o", "json",
                              "-p", "Reply with exactly: SMOKE_TEST_OK"],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, timeout=120, env=gemini_env,
+                            timeout=120, env=gemini_env, **decode_kwargs(),
                         )
                     check("Gemini CLI exits cleanly", gemini_result.returncode == 0,
                           f"Exit code {gemini_result.returncode}, stderr: {gemini_result.stderr[:300]}")
@@ -588,7 +589,7 @@ async def main():
     project_base = os.path.dirname(script_dir)
     config_path = args.config or os.path.join(project_base, "config.yaml")
 
-    with open(config_path) as f:
+    with open(config_path, encoding="utf-8") as f:
         config = yaml.safe_load(f)
 
     ok = await run_smoke_test(config, config_path)

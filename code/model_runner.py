@@ -12,9 +12,14 @@ import asyncio
 import json
 import os
 import subprocess
+import sys
 import tempfile
 import time
 from datetime import datetime
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+from compat import decode_kwargs, resolve_cli  # noqa: E402
 
 
 class ModelRunnerError(Exception):
@@ -97,7 +102,7 @@ async def run_claude_agent(
         call_name: Human-readable label for this call.
         instructions: Optional system prompt to append.
     """
-    cli_path = claude_opts.get("cli_path", "claude")
+    cli_path = resolve_cli(claude_opts.get("cli_path", "claude"))
     model = claude_opts.get("model", "claude-fable-5-1")
     extra_env = claude_opts.get("env", {})
 
@@ -124,9 +129,9 @@ async def run_claude_agent(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
             cwd=working_dir,
             env=env,
+            **decode_kwargs(),
         )
 
     MAX_RETRIES = 3
@@ -280,7 +285,7 @@ async def run_codex_agent(
         tracker: Optional TokenTracker for recording token usage.
         call_name: Human-readable label for this call.
     """
-    cli_path = codex_config.get("cli_path", "codex")
+    cli_path = resolve_cli(codex_config.get("cli_path", "codex"))
     model = codex_config.get("model", "gpt-6-astra")
     reasoning = codex_config.get("reasoning_effort", "max")
 
@@ -302,8 +307,8 @@ async def run_codex_agent(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
             cwd=working_dir,
+            **decode_kwargs(),
         )
 
     start = datetime.now()
@@ -431,7 +436,7 @@ async def run_gemini_agent(
         tracker: Optional TokenTracker for recording token usage.
         call_name: Human-readable label for this call.
     """
-    cli_path = gemini_config.get("cli_path", "gemini")
+    cli_path = resolve_cli(gemini_config.get("cli_path", "gemini"))
     model = gemini_config.get("model", "gemini-3.1-pro-preview")
     api_key = gemini_config.get("api_key", "")
     approval_mode = gemini_config.get("approval_mode", "yolo")
@@ -483,18 +488,18 @@ async def run_gemini_agent(
                     cmd,
                     stdout=subprocess.PIPE,
                     stderr=subprocess.PIPE,
-                    text=True,
                     cwd=working_dir,
                     env=env,
+                    **decode_kwargs(),
                 )
 
         return subprocess.run(
             cmd,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
             cwd=working_dir,
             env=env,
+            **decode_kwargs(),
         )
 
     start = datetime.now()

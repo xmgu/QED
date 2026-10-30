@@ -279,7 +279,17 @@ if run_clicked:
     write_file(_prove_hh_path(out_dir), st.session_state.global_prove_hh)
     write_file(_verify_hh_path(out_dir), st.session_state.global_verify_hh)
 
-    proc = start_pipeline(problem_file, out_dir, config)
+    try:
+        proc = start_pipeline(problem_file, out_dir, config)
+    except RuntimeError as exc:
+        # A missing or unusable shell is the most common cause; show the
+        # actionable message instead of a raw traceback.
+        st.error(str(exc))
+        st.stop()
+    except OSError as exc:
+        st.error(f"Could not start the pipeline: {exc}")
+        st.stop()
+
     st.session_state.process = proc
     st.session_state.run_active = True
     st.session_state.show_resume = False
@@ -329,7 +339,15 @@ if st.session_state.show_resume and not st.session_state.run_active:
                 write_file(_verify_hh_path(out_dir),
                            st.session_state.global_verify_hh)
 
-                proc = start_pipeline(problem_file, out_dir, config)
+                try:
+                    proc = start_pipeline(problem_file, out_dir, config)
+                except RuntimeError as exc:
+                    st.error(str(exc))
+                    st.stop()
+                except OSError as exc:
+                    st.error(f"Could not start the pipeline: {exc}")
+                    st.stop()
+
                 st.session_state.process = proc
                 st.session_state.run_active = True
                 st.session_state.show_resume = False

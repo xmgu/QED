@@ -3,8 +3,15 @@
 import json
 import os
 import re
+import sys
 
 import yaml
+
+# The compat helpers live next to the pipeline code, not next to the UI.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))), "code"))
+
+from compat import read_text, write_text  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # Path constants
@@ -48,7 +55,7 @@ GEMINI_THINKING_LEVELS = ("HIGH", "MEDIUM", "LOW", "NONE")
 
 def load_config(path: str) -> dict:
     """Read a YAML config file and return the parsed dict."""
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f) or {}
 
 
@@ -57,7 +64,7 @@ def save_config(config: dict, path: str) -> None:
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
-    with open(path, "w") as f:
+    with open(path, "w", encoding="utf-8") as f:
         yaml.dump(config, f, default_flow_style=False, sort_keys=False)
 
 
@@ -66,34 +73,26 @@ def save_config(config: dict, path: str) -> None:
 # ---------------------------------------------------------------------------
 
 def read_file(path: str) -> str:
-    """Read a text file. Return ``""`` if missing."""
-    if not os.path.exists(path):
-        return ""
-    try:
-        with open(path) as f:
-            return f.read()
-    except OSError:
-        return ""
+    """Read a text file. Return ``""`` if missing.
+
+    Decoding is lenient: the pipeline log is a capture of the shell and
+    model-CLI output, which on a Chinese Windows install is written in
+    the locale code page (GBK) rather than UTF-8. A strict decode would
+    raise ``UnicodeDecodeError`` and take the whole UI down.
+    """
+    return read_text(path)
 
 
 def write_file(path: str, content: str) -> None:
     """Write *content* to *path*, creating parent directories if needed."""
-    parent = os.path.dirname(path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    with open(path, "w") as f:
-        f.write(content)
+    write_text(path, content)
 
 
 def file_nonempty(path: str) -> bool:
     """Return True if *path* exists and has non-whitespace content."""
     if not os.path.exists(path):
         return False
-    try:
-        with open(path) as f:
-            return bool(f.read().strip())
-    except OSError:
-        return False
+    return bool(read_text(path).strip())
 
 
 # ---------------------------------------------------------------------------
@@ -119,16 +118,17 @@ def parse_difficulty(output_dir: str) -> str:
     if not os.path.exists(path):
         return "unknown"
     try:
-        with open(path) as f:
-            for line in f:
-                if "classification" in line.lower():
-                    upper = line.upper()
-                    if "EASY" in upper:
-                        return "easy"
-                    if "MEDIUM" in upper:
-                        return "medium"
-                    if "HARD" in upper:
-                        return "hard"
+        # The file is written by the survey agent, so it may carry the
+        # locale code page rather than UTF-8.
+        for line in read_text(path).splitlines():
+            if "classification" in line.lower():
+                upper = line.upper()
+                if "EASY" in upper:
+                    return "easy"
+                if "MEDIUM" in upper:
+                    return "medium"
+                if "HARD" in upper:
+                    return "hard"
     except OSError:
         pass
     return "unknown"
@@ -302,7 +302,6 @@ def parse_token_usage(output_dir: str) -> dict | None:
     if not os.path.exists(path):
         return None
     try:
-        with open(path) as f:
-            return json.load(f)
+        return json.loads(read_text(path))
     except (json.JSONDecodeError, OSError):
         return None

@@ -266,6 +266,72 @@ From your activated venv or Conda environment, with `QED_PYTHON` set as above:
 bash run.sh
 ```
 
+#### Running on native Windows
+
+The pipeline runs on Windows as well as macOS/Linux. Two things to know:
+
+1. **Git Bash is required.** The entry point is a shell script, so Git for
+   Windows (or MSYS2) must be installed. Several programs answer to the
+   name `bash.exe` on Windows, and only one of them works here:
+
+   | Path | What it is | Usable |
+   |------|------------|--------|
+   | `C:\Windows\System32\bash.exe` | WSL launcher stub | no |
+   | `%LOCALAPPDATA%\Microsoft\WindowsApps\bash.exe` | WSL App Execution Alias (0-byte reparse point) | no |
+   | `...\Git\bin\bash.exe` | Git Bash | **yes** |
+
+   The WSL stubs re-parse a Windows path as a POSIX word, so the
+   backslashes are consumed as escapes and the script is looked up under
+   a mangled name such as `D:WorkbuddyproofqedQEDrun.sh` — reported as
+   `No such file or directory`.
+
+   The UI locates a working shell automatically: it skips the WSL stubs,
+   scans the usual Git / MSYS2 / Scoop install locations, and *probes*
+   each candidate to confirm it can resolve a Windows path. The sidebar
+   shows the resolved shell under **Shell**.
+
+   To override the choice, set `QED_BASH` to the full path of `bash.exe`:
+
+   ```powershell
+   setx QED_BASH "C:\Program Files\Git\bin\bash.exe"
+   ```
+
+   If Git is installed through Scoop, the path is versioned — use the
+   stable `current` symlink:
+
+   ```powershell
+   setx QED_BASH "D:\Scoop\apps\git\current\bin\bash.exe"
+   ```
+
+2. **Use the Streamlit UI rather than the shell scripts** if you prefer.
+   `python -m streamlit run ui/app.py` handles process launch, tree
+   termination, path conversion and interpreter detection for you on every
+   platform.
+
+From PowerShell or cmd.exe, invoke the script through Git Bash explicitly.
+Backslash paths are accepted — the script normalizes them:
+
+```powershell
+& "C:\Program Files\Git\bin\bash.exe" "D:\path\to\QED\run.sh"
+```
+
+If you keep the shell in Git Bash, use forward slashes (or just `cd` into
+the project first and call `bash run.sh`):
+
+```bash
+bash /d/path/to/QED/run.sh
+```
+
+The scripts detect the interpreter in this order: `$QED_PYTHON`, then
+`.venv/bin/python` (macOS/Linux), then `.venv/Scripts/python.exe` (Windows),
+then the `agent` Conda environment. A virtual environment in the project
+root is therefore picked up without any configuration.
+
+The scripts also avoid depending on Git's coreutils (`dirname`, `cp`) — a
+Git Bash launched from PowerShell inherits the Windows `PATH`, which does
+not include `/usr/bin`. Any file copying falls back to the Python
+interpreter when `cp` is unavailable.
+
 The input file should be a LaTeX problem statement:
 
 ```latex

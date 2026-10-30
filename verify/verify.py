@@ -27,6 +27,11 @@ import tempfile
 
 import yaml
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))), "code"))
+
+from compat import decode_kwargs, resolve_cli  # noqa: E402
+
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -47,7 +52,7 @@ PROMPT_CHECK_PROBLEM = os.path.join(SCRIPT_DIR, "prompt_check_problem.md")
 # ---------------------------------------------------------------------------
 
 def load_config(path: str) -> dict:
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         return yaml.safe_load(f)
 
 
@@ -148,7 +153,7 @@ def merge_provider_section(config: dict, role_cfg: dict) -> tuple[str, dict]:
 # ---------------------------------------------------------------------------
 
 def load_prompt(path: str, **kwargs) -> str:
-    with open(path) as f:
+    with open(path, encoding="utf-8") as f:
         template = f.read()
     return template.format(**kwargs)
 
@@ -159,7 +164,7 @@ def load_prompt(path: str, **kwargs) -> str:
 
 def run_claude(prompt: str, claude_opts: dict, model_override: str | None = None) -> str:
     """Invoke Claude CLI and return response text."""
-    cli_path = claude_opts.get("cli_path", "claude")
+    cli_path = resolve_cli(claude_opts.get("cli_path", "claude"))
     model = model_override or claude_opts.get("model", "claude-fable-5-1")
     extra_env = claude_opts.get("env", {})
 
@@ -178,7 +183,7 @@ def run_claude(prompt: str, claude_opts: dict, model_override: str | None = None
     env.update(extra_env)
 
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True, env=env)
+                            env=env, **decode_kwargs())
 
     if result.returncode != 0:
         print(f"[Claude] Non-zero exit code: {result.returncode}", file=sys.stderr)
@@ -199,7 +204,7 @@ def run_claude(prompt: str, claude_opts: dict, model_override: str | None = None
 
 def run_codex(prompt: str, codex_cfg: dict, model_override: str | None = None) -> str:
     """Invoke Codex CLI and return response text."""
-    cli_path = codex_cfg.get("cli_path", "codex")
+    cli_path = resolve_cli(codex_cfg.get("cli_path", "codex"))
     model = model_override or codex_cfg.get("model", "gpt-6-astra")
     reasoning = codex_cfg.get("reasoning_effort", "max")
 
@@ -217,7 +222,7 @@ def run_codex(prompt: str, codex_cfg: dict, model_override: str | None = None) -
     ]
 
     result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            text=True)
+                            **decode_kwargs())
 
     response = ""
     try:
@@ -249,7 +254,7 @@ def run_codex(prompt: str, codex_cfg: dict, model_override: str | None = None) -
 
 def run_gemini(prompt: str, gemini_cfg: dict, model_override: str | None = None) -> str:
     """Invoke Gemini CLI and return response text."""
-    cli_path = gemini_cfg.get("cli_path", "gemini")
+    cli_path = resolve_cli(gemini_cfg.get("cli_path", "gemini"))
     model = model_override or gemini_cfg.get("model", "gemini-3.1-pro-preview")
     api_key = gemini_cfg.get("api_key", "")
     approval_mode = gemini_cfg.get("approval_mode", "yolo")
@@ -291,14 +296,16 @@ def run_gemini(prompt: str, gemini_cfg: dict, model_override: str | None = None)
                     }]
                 }
             }
-            with open(settings_path, "w") as f:
+            with open(settings_path, "w", encoding="utf-8") as f:
                 json.dump(settings, f)
-            env["GEMINI_CLI_HOME"] = gemini_home
-            result = subprocess.run(cmd, stdout=subprocess.PIPE,
-                                    stderr=subprocess.PIPE, text=True, env=env)
+                env["GEMINI_CLI_HOME"] = gemini_home
+                result = subprocess.run(cmd, stdout=subprocess.PIPE,
+                                        stderr=subprocess.PIPE, env=env,
+                                        **decode_kwargs())
     else:
         result = subprocess.run(cmd, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True, env=env)
+                                stderr=subprocess.PIPE, env=env,
+                                **decode_kwargs())
 
     if result.returncode != 0:
         print(f"[Gemini] Non-zero exit code: {result.returncode}", file=sys.stderr)
@@ -435,7 +442,7 @@ def assemble_report(difficulty: str, judge_output: str,
 def write_report(report: str, output_path: str | None):
     """Write report to file or stdout."""
     if output_path:
-        with open(output_path, "w") as f:
+        with open(output_path, "w", encoding="utf-8") as f:
             f.write(report)
         print(f"Report written to {output_path}", file=sys.stderr)
     else:
@@ -448,7 +455,7 @@ def run_problem_only(args):
         print(f"Error: problem file not found: {args.problem}", file=sys.stderr)
         sys.exit(1)
 
-    with open(args.problem) as f:
+    with open(args.problem, encoding="utf-8") as f:
         problem_text = f.read()
 
     config = load_config(args.config)
@@ -474,9 +481,9 @@ def output_dir_from_args(args) -> str | None:
 
 def run_verification(args):
     """Full verification mode: problem + proof."""
-    with open(args.problem) as f:
+    with open(args.problem, encoding="utf-8") as f:
         problem_text = f.read()
-    with open(args.proof) as f:
+    with open(args.proof, encoding="utf-8") as f:
         proof_text = f.read()
 
     config = load_config(args.config)
