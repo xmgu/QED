@@ -30,7 +30,7 @@ import yaml
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
     os.path.abspath(__file__))), "code"))
 
-from compat import decode_kwargs, resolve_cli  # noqa: E402
+from compat import decode_kwargs, resolve_cli, run_cli  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
@@ -183,8 +183,7 @@ def run_claude(prompt: str, claude_opts: dict, model_override: str | None = None
     env = {k: v for k, v in os.environ.items() if k not in _PROVIDER_VARS}
     env.update(extra_env)
 
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            env=env, **decode_kwargs())
+    result = run_cli(cmd, env=env)
 
     if result.returncode != 0:
         print(f"[Claude] Non-zero exit code: {result.returncode}", file=sys.stderr)
@@ -222,8 +221,7 @@ def run_codex(prompt: str, codex_cfg: dict, model_override: str | None = None) -
         prompt,
     ]
 
-    result = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                            **decode_kwargs())
+    result = run_cli(cmd)
 
     response = ""
     try:
@@ -300,13 +298,9 @@ def run_gemini(prompt: str, gemini_cfg: dict, model_override: str | None = None)
             with open(settings_path, "w", encoding="utf-8") as f:
                 json.dump(settings, f)
                 env["GEMINI_CLI_HOME"] = gemini_home
-                result = subprocess.run(cmd, stdout=subprocess.PIPE,
-                                        stderr=subprocess.PIPE, env=env,
-                                        **decode_kwargs())
+                result = run_cli(cmd, env=env)
     else:
-        result = subprocess.run(cmd, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, env=env,
-                                **decode_kwargs())
+        result = run_cli(cmd, env=env)
 
     if result.returncode != 0:
         print(f"[Gemini] Non-zero exit code: {result.returncode}", file=sys.stderr)
@@ -395,14 +389,7 @@ def run_dsh(prompt: str, dsh_cfg: dict, model_override: str | None = None) -> st
     env["DSH_PERMISSION_MODE"] = permission_mode
 
     try:
-        result = subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            env=env,
-            input=prompt,
-            **decode_kwargs(),
-        )
+        result = run_cli(cmd, env=env, input_text=prompt)
     finally:
         if patch_path:
             _remove_file(patch_path)

@@ -19,7 +19,7 @@ from datetime import datetime
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from compat import decode_kwargs, resolve_cli  # noqa: E402
+from compat import decode_kwargs, resolve_cli, run_cli_async  # noqa: E402
 
 
 class ModelRunnerError(Exception):
@@ -124,16 +124,6 @@ async def run_claude_agent(
     env = {k: v for k, v in os.environ.items() if k not in _PROVIDER_VARS}
     env.update(extra_env)
 
-    def _call():
-        return subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=working_dir,
-            env=env,
-            **decode_kwargs(),
-        )
-
     MAX_RETRIES = 3
     RETRY_BACKOFF = [30, 60, 120]  # seconds between retries
 
@@ -146,7 +136,7 @@ async def run_claude_agent(
         attempt_start = datetime.now()
 
         try:
-            result = await asyncio.get_event_loop().run_in_executor(None, _call)
+            result = await run_cli_async(cmd, cwd=working_dir, env=env)
         except Exception as exc:
             elapsed = (datetime.now() - attempt_start).total_seconds()
             if logger:
@@ -302,21 +292,12 @@ async def run_codex_agent(
         prompt,
     ]
 
-    def _call():
-        return subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=working_dir,
-            **decode_kwargs(),
-        )
-
     start = datetime.now()
     if logger:
         logger.log(f"[Codex] Starting {call_name} (model={model})")
 
     try:
-        result = await asyncio.get_event_loop().run_in_executor(None, _call)
+        result = await run_cli_async(cmd, cwd=working_dir)
     except Exception as exc:
         elapsed = (datetime.now() - start).total_seconds()
         if logger:
@@ -451,63 +432,47 @@ async def run_gemini_agent(
         "-p", prompt,
     ]
 
-    def _call():
+    def _make_env():
         env = os.environ.copy()
         if api_key:
             env["GEMINI_API_KEY"] = api_key
+        return env
 
-        thinking_config = {}
-        if thinking_level:
-            thinking_config["thinkingLevel"] = thinking_level
-        if thinking_budget is not None:
-            thinking_config["thinkingBudget"] = thinking_budget
-
-        if thinking_config:
-            with tempfile.TemporaryDirectory(prefix="qed-gemini-home-") as gemini_home:
-                settings_dir = os.path.join(gemini_home, ".gemini")
-                os.makedirs(settings_dir, exist_ok=True)
-                settings_path = os.path.join(settings_dir, "settings.json")
-                settings = {
-                    "modelConfigs": {
-                        "overrides": [
-                            {
-                                "match": {"model": model},
-                                "modelConfig": {
-                                    "generateContentConfig": {
-                                        "thinkingConfig": thinking_config,
-                                    }
-                                },
+    def _write_thinking_config(gemini_home):
+        settings_dir = os.path.join(gemini_home, ".gemini")
+        os.makedirs(settings_dir, exist_ok=True)
+        settings_path = os.path.join(settings_dir, "settings.json")
+        settings = {
+            "modelConfigs": {
+                "overrides": [
+                    {
+                        "match": {"model": model},
+                        "modelConfig": {
+                            "generateContentConfig": {
+                                "thinkingConfig": thinking_config,
                             }
-                        ]
+                        },
                     }
-                }
-                with open(settings_path, "w", encoding="utf-8") as f:
-                    json.dump(settings, f)
-                env["GEMINI_CLI_HOME"] = gemini_home
-                return subprocess.run(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    cwd=working_dir,
-                    env=env,
-                    **decode_kwargs(),
-                )
-
-        return subprocess.run(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            cwd=working_dir,
-            env=env,
-            **decode_kwargs(),
-        )
+                ]
+            }
+        }
+        with open(settings_path, "w", encoding="utf-8") as f:
+            json.dump(settings, f)
+        return settings_path
 
     start = datetime.now()
     if logger:
         logger.log(f"[Gemini] Starting {call_name} (model={model})")
 
     try:
-        result = await asyncio.get_event_loop().run_in_executor(None, _call)
+        if thinking_config:
+            with tempfile.TemporaryDirectory(prefix="qed-gemini-home-") as gemini_home:
+                _write_thinking_config(gemini_home)
+                env = _make_env()
+                env["GEMINI_CLI_HOME"] = gemini_home
+                result = await run_cli_async(cmd, cwd=working_dir, env=env)
+        else:
+            result = await run_cli_async(cmd, cwd=working_dir, env=_make_env())
     except Exception as exc:
         elapsed = (datetime.now() - start).total_seconds()
         if logger:
@@ -692,7 +657,7 @@ async def run_dsh_agent(
             cmd += ["--patch", patch_path]
     cmd.append("--json")
 
-    def _call():
+    def _make_env():
         env = os.environ.copy()
         if api_key:
             env["DEEPSEEK_API_KEY"] = api_key
@@ -700,26 +665,19 @@ async def run_dsh_agent(
         # pipeline needs file read/write and shell access inside the
         # output directory, which is what "danger-full-access" grants.
         env["DSH_PERMISSION_MODE"] = permission_mode
-        try:
-            return subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                cwd=working_dir,
-                env=env,
-                input=prompt,
-                **decode_kwargs(),
-            )
-        finally:
-            if patch_path:
-                _remove_file(patch_path)
+        return env
 
     start = datetime.now()
     if logger:
         logger.log(f"[DSH] Starting {call_name} (model={model})")
 
     try:
-        result = await asyncio.get_event_loop().run_in_executor(None, _call)
+        try:
+            result = await run_cli_async(cmd, cwd=working_dir,
+                                         env=_make_env(), input_text=prompt)
+        finally:
+            if patch_path:
+                _remove_file(patch_path)
     except Exception as exc:
         elapsed = (datetime.now() - start).total_seconds()
         if logger:

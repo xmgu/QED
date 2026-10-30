@@ -94,6 +94,8 @@ def start_pipeline(
         **spawn_kwargs(),
     )
     proc._log_fh = log_fh
+    global _active_process
+    _active_process = proc
     return proc
 
 
@@ -157,6 +159,62 @@ def kill_pipeline(proc: subprocess.Popen | None) -> None:
         pass
     _close_log(proc)
 
+
+# ---------------------------------------------------------------------------
+# Cleanup on exit
+# ---------------------------------------------------------------------------
+
+#: The pipeline currently running, so a shutdown hook can stop it.
+_active_process: subprocess.Popen | None = None
+
+
+def _terminate_active(signum=None, frame=None) -> None:
+    """Stop the running pipeline when the UI is interrupted or exits.
+
+    Without this the pipeline keeps running after the UI is closed with
+    Ctrl+C: it is a detached process tree, so it survives its parent and
+    goes on consuming the model API.
+    """
+    proc = _active_process
+    if proc is not None and proc.poll() is None:
+        try:
+            kill_pipeline(proc)
+        except Exception:
+            pass
+
+
+def install_cleanup_handlers() -> None:
+    """Make sure the pipeline is stopped when the UI goes away.
+
+    ``atexit`` covers a normal exit; the SIGINT/SIGTERM handlers cover
+    an interrupted one. The handlers clean up the pipeline and then let
+    the default behaviour run, so the process still dies the way the
+    user asked it to.
+    """
+    import atexit
+    import signal
+
+    atexit.register(_terminate_active)
+
+    def _handler(signum, frame):
+        _terminate_active()
+        # Restore the default handler and re-raise, so the exit status
+        # still reflects the signal.
+        try:
+            signal.signal(signum, signal.SIG_DFL)
+            os.kill(os.getpid(), signum)
+        except (OSError, ValueError):
+            raise KeyboardInterrupt
+
+    for name in ("SIGINT", "SIGTERM", "SIGBREAK"):
+        sig = getattr(signal, name, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, _handler)
+        except (OSError, ValueError):
+            # Not on the main thread, or the signal is not supported.
+            pass
 
 
 def _close_log(proc: subprocess.Popen | None) -> None:

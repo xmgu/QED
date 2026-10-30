@@ -26,9 +26,11 @@ Two classes of difference matter here:
 """
 
 import os
+import queue
 import shutil
 import subprocess
 import sys
+import threading
 
 
 # ---------------------------------------------------------------------------
@@ -349,13 +351,48 @@ def spawn_kwargs() -> dict:
     """Return the platform-specific ``Popen`` keyword arguments.
 
     POSIX uses ``preexec_fn=os.setsid`` to detach the child into its own
-    process group so the whole tree can be signalled at once. Windows has
-    no ``setsid``; ``CREATE_NEW_PROCESS_GROUP`` is the equivalent and is
-    used together with ``taskkill /T`` for tree termination.
+    process group so the whole tree can be signalled at once.
+
+    Windows has no ``setsid``. ``CREATE_NEW_PROCESS_GROUP`` is the
+    nearest equivalent, but it comes with a documented catch: *CTRL+C
+    signals are disabled for all processes within the new process group*.
+    That would make the pipeline ignore Ctrl+C entirely, so it is not
+    used here. The tree is terminated with ``taskkill /T`` instead,
+    which does not need a process group of its own.
     """
     if IS_WINDOWS:
-        return {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP}
+        return {}
     return {"preexec_fn": os.setsid}
+
+
+def run_cli(cmd: list[str], *, timeout: float | None = None,
+            cwd: str | None = None, env: dict | None = None,
+            input_text: str | None = None) -> subprocess.CompletedProcess:
+    """Run a model CLI on the calling thread, keeping it interruptible.
+
+    ``subprocess.run`` in the calling thread responds to Ctrl+C: the
+    signal reaches the child through the console and the wait is
+    interrupted.
+
+    Running the call in an executor thread -- which is how the async
+    pipeline dispatches it -- breaks that. The default thread pool uses
+    *non-daemon* threads, and CPython joins them in an atexit hook, so
+    the interpreter refuses to exit while a call is in flight. Pressing
+    Ctrl+C then appears to do nothing: the main thread unwinds, but the
+    process waits for the model CLI to finish on its own.
+
+    Use :func:`run_cli_async` from async code; this helper is for the
+    synchronous callers (the verifier).
+    """
+    kwargs = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if cwd is not None:
+        kwargs["cwd"] = cwd
+    if env is not None:
+        kwargs["env"] = env
+    if timeout is not None:
+        kwargs["timeout"] = timeout
+
+    return subprocess.run(cmd, input=input_text, **kwargs, **decode_kwargs())
 
 
 def kill_process_tree(pid: int) -> None:
@@ -394,6 +431,145 @@ def kill_process_tree(pid: int) -> None:
         os.killpg(pgid, signal.SIGKILL)
     except (ProcessLookupError, OSError):
         pass
+
+
+# ---------------------------------------------------------------------------
+# Interruptible execution
+# ---------------------------------------------------------------------------
+
+async def run_cli_async(cmd: list[str], *, timeout: float | None = None,
+                        cwd: str | None = None, env: dict | None = None,
+                        input_text: str | None = None):
+    """Run a CLI in a way that Ctrl+C can actually interrupt.
+
+    The pipeline dispatches model calls from async code, which normally
+    means handing the blocking call to a thread pool. The default pool
+    uses non-daemon threads, and CPython joins them during interpreter
+    shutdown -- so the process cannot exit while a model call is still
+    running. Ctrl+C would unwind the main thread but leave the CLI
+    running to completion, which looks like an unresponsive program.
+
+    This helper runs the call on a *daemon* thread instead. When the
+    awaiting coroutine is cancelled -- which is what Ctrl+C does to the
+    task -- the child process tree is terminated before the thread is
+    abandoned, so nothing is left running.
+    """
+    import asyncio
+
+    loop = asyncio.get_event_loop()
+    holder: dict = {"process": None}
+
+    def _call():
+        kwargs = dict(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        if cwd is not None:
+            kwargs["cwd"] = cwd
+        if env is not None:
+            kwargs["env"] = env
+        if input_text is not None:
+            kwargs["input"] = input_text
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+
+        proc = subprocess.Popen(cmd, **kwargs, **decode_kwargs())
+        holder["process"] = proc
+        try:
+            stdout, stderr = proc.communicate()
+        except BaseException:
+            # The wait was interrupted: do not leave the CLI running.
+            _terminate(proc)
+            raise
+        return subprocess.CompletedProcess(
+            cmd, proc.returncode, stdout, stderr)
+
+    def _terminate(proc) -> None:
+        try:
+            if IS_WINDOWS:
+                kill_process_tree(proc.pid)
+            else:
+                kill_process_tree(proc.pid)
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+
+    future = loop.run_in_executor(_daemon_executor(), _call)
+    try:
+        return await asyncio.shield(future)
+    except asyncio.CancelledError:
+        proc = holder.get("process")
+        if proc is not None:
+            _terminate(proc)
+        raise
+
+
+_executor = None
+
+
+class _DaemonThreadPool:
+    """A minimal thread pool whose workers are daemon threads.
+
+    ``concurrent.futures.ThreadPoolExecutor`` does not offer a daemon
+    switch, and a thread's daemon flag cannot be changed once it has
+    started ("cannot set daemon status of active thread"). So the pool is
+    implemented directly: a queue of jobs, a fixed set of worker
+    threads, each created as a daemon before it is started.
+
+    Daemon threads are not joined at interpreter shutdown, which is the
+    point: a model call that is still running must not keep the process
+    alive after Ctrl+C.
+    """
+
+    def __init__(self, max_workers: int = 8):
+        self._queue = queue.Queue()
+        self._threads: list = []
+        self._lock = threading.Lock()
+        self._max_workers = max_workers
+
+    def submit(self, fn, *args, **kwargs):
+        import concurrent.futures
+
+        future = concurrent.futures.Future()
+
+        def _run():
+            if future.set_running_or_notify_cancel():
+                try:
+                    future.set_result(fn(*args, **kwargs))
+                except BaseException as exc:
+                    future.set_exception(exc)
+
+        with self._lock:
+            if len(self._threads) < self._max_workers:
+                thread = threading.Thread(
+                    target=self._worker, daemon=True,
+                    name=f"qed-cli-{len(self._threads)}")
+                self._threads.append(thread)
+                thread.start()
+        self._queue.put(_run)
+        return future
+
+    def _worker(self):
+        while True:
+            job = self._queue.get()
+            try:
+                job()
+            finally:
+                self._queue.task_done()
+
+    def shutdown(self, wait: bool = True, **kwargs):
+        self._queue.put(None)
+
+
+def _daemon_executor():
+    """Return the process-wide daemon thread pool."""
+    global _executor
+    if _executor is None:
+        _executor = _DaemonThreadPool()
+    return _executor
 
 
 # ---------------------------------------------------------------------------
