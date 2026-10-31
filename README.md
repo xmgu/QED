@@ -178,9 +178,8 @@ The pipeline runs in three stages: literature survey (Stage 0), the decompositio
 | [Claude CLI](https://code.claude.com/docs/en/setup) | LLM backend | `curl -fsSL https://claude.ai/install.sh \| bash` (macOS/Linux/WSL) |
 | [Codex CLI](https://github.com/openai/codex) | LLM backend | `npm install -g @openai/codex` |
 | [Gemini CLI](https://github.com/google-gemini/gemini-cli) | LLM backend | `npm install -g @google/gemini-cli` |
-| [DeepSeek Harness](https://github.com/deepseek-ai) (`dsh`) | LLM backend | install the DeepSeek Harness CLI |
 
-You need at least one model CLI installed. Install only the ones you plan to use — every agent role in `config.yaml` can be set to `"claude"`, `"codex"`, `"gemini"`, or `"dsh"`.
+You need at least one model CLI installed. Install only the ones you plan to use — every agent role in `config.yaml` can be set to `"claude"`, `"codex"`, or `"gemini"`.
 
 The configuration prioritizes capability for mathematical proof search. Model selections were checked against official documentation on **September 22, 2026**:
 
@@ -189,113 +188,8 @@ The configuration prioritizes capability for mathematical proof search. Model se
 | Codex | [GPT-6 Astra](https://developers.openai.com/api/docs/models/gpt-6-astra) (`gpt-6-astra`), OpenAI's most capable model | `max` |
 | Claude | [Claude Fable 5.1](https://platform.claude.com/docs/en/models/fable-5-1/overview) (`claude-fable-5-1`), Anthropic's choice for the most demanding reasoning | Adaptive thinking; use `CLAUDE_CODE_EFFORT_LEVEL=max` for maximum effort |
 | Gemini | [Gemini 3.1 Pro Preview](https://ai.google.dev/gemini-api/docs/models/gemini-3.1-pro-preview) (`gemini-3.1-pro-preview`), selected for complex reasoning | `HIGH` for API access; CLI/model defaults for saved Google login (see subscription track) |
-| DeepSeek Harness | `deepseek-flash` (default), `deepseek-chat`, `deepseek-reasoner` | The harness picks the model through its own profile; the `dsh:` section sets the default |
 
-All shipped agent roles use Codex and inherit its global model and reasoning setting. Change an agent's `provider` to use Claude, Gemini or dsh. These are provider-specific choices for this workflow, not a measured ranking on QED's problems. Fable 5.1 requires [Claude Code 2.1.257 or later](https://code.claude.com/docs/en/model-config).
-
-### DeepSeek Harness (`dsh`)
-
-QED drives the DeepSeek Harness through its `headless` profile, which answers
-one task and exits:
-
-```bash
-dsh --profile headless --json
-```
-
-The prompt is passed through **stdin** rather than as a command-line
-argument, so there is no length limit on the rendered prompts (they reach
-20-30 k characters, which exceeds the Windows command-line cap of 32767).
-The harness answers with newline-delimited JSON events; QED reads the
-`final` event.
-
-Configure it in the `dsh:` section of `config.yaml`:
-
-```yaml
-dsh:
-  cli_path: "dsh"
-  profile: "headless"
-  model: "deepseek-v4-flash"    # a model id the provider route exposes
-  provider: "sufe"              # the harness' provider route for the model
-  permission_mode: "danger-full-access"
-  api_key: ""  # or export DEEPSEEK_API_KEY
-```
-
-`permission_mode` maps to the harness's own presets: `read-only`,
-`workspace-write`, or `danger-full-access`. It decides two things: the
-sandbox the agent runs in, and whether the agent has to ask before going
-beyond it (`ask` for the first two, `never` for the last).
-
-`workspace-write` is enough for the proof agents: they write their
-decomposition and proof files into the output directory and run shell
-commands, and the measured behaviour is the same as with unrestricted
-access. `read-only` is not — the agent cannot write its output at all.
-
-Note that on Windows the sandbox does not enforce the workspace boundary:
-an agent running under `workspace-write` was still able to write outside
-it. Only `read-only` is a real restriction there.
-
-On Windows the harness has no bash tool (`tool-bash` is disabled for
-`win32`); the agent uses PowerShell instead.
-
-The model is not a command-line flag: the harness resolves it through the
-`agent-default-model` plugin of its profile, so QED selects a different
-model by overlaying that plugin with a `--patch` file. Both `provider` and
-`model` are required in the patch.
-
-#### Setting up the profile
-
-The harness keeps its provider routes and credentials per profile, and the
-`headless` profile QED drives ships empty. The `desktop` profile — where
-the desktop app configures a third-party OpenAI-compatible endpoint — is
-locked to the Electron application and cannot be used from the command
-line. So the provider definition has to be copied over:
-
-```bash
-python code/setup_dsh_profile.py          # desktop -> headless
-python code/setup_dsh_profile.py --show   # print the current state
-```
-
-The script copies the `agent-default-model` and `llm-pi-ai` entries, and
-enables the local credentials plugin — it is disabled by default, so
-without that the CLI ignores `~/.dsh/.credentials.yaml` and reports
-`MISSING_CREDENTIAL` even though the key is stored there. The previous
-patch file is kept as `cordis.patch.yml.bak`.
-
-Two details the script takes care of:
-
-* **Key groups.** The desktop app can point a provider at a *group* of
-  keys (`KEYSMGR_SUFE_F3635D`); the `dsh-keys-manager` bundle expands it
-  into the individual keys. That bundle is part of the desktop profile
-  only, so the command line cannot resolve a group name. The script maps
-  it onto a stored reference.
-* **Exhausted keys.** A group holds several keys and the desktop app
-  rotates through them, skipping the ones that ran out of quota. The
-  command line has no key manager, so the script probes the keys one by
-  one and selects one that still works.
-
-Check the result with:
-
-```bash
-echo "Reply with exactly: OK" | dsh --profile headless --json
-```
-
-**Credentials.** The harness needs an API key for the selected route. It
-reads it from the environment or from the credentials service
-(`~/.dsh/.credentials.yaml`), which the desktop app's *Models* page
-writes:
-
-```powershell
-setx SUFE_API_KEY "sk-..."      # the apiKeyEnv of your route
-```
-
-or paste it into `dsh.api_key` in `config.yaml` (or into the *DeepSeek
-Harness (dsh)* block of the sidebar). Without a key the harness exits with
-`MISSING_CREDENTIAL` and the pipeline stops in its smoke test.
-
-Note that the provider reserves the maximum output up front, so a request
-can be refused with `insufficient_user_quota` even when the account has
-plenty of quota left over for the actual answer. Re-running
-`setup_dsh_profile.py` picks a key whose reservation fits.
+All shipped agent roles use Codex and inherit its global model and reasoning setting. Change an agent's `provider` to use Claude or Gemini. These are provider-specific choices for this workflow, not a measured ranking on QED's problems. Fable 5.1 requires [Claude Code 2.1.257 or later](https://code.claude.com/docs/en/model-config).
 
 ### Installation
 
@@ -669,7 +563,7 @@ After completing either track, run the [Runtime Checks](#runtime-checks), then u
 
 ### Per-Agent Model Selection
 
-Every agent role is configured as a dict with at least a `provider` field. Any other field overrides the corresponding knob from the global `claude:` / `codex:` / `gemini:` / `dsh:` section for that one agent. Knobs you don't set fall back to the global section.
+Every agent role is configured as a dict with at least a `provider` field. Any other field overrides the corresponding knob from the global `claude:` / `codex:` / `gemini:` section for that one agent. Knobs you don't set fall back to the global section.
 
 ```yaml
 decomposition:
@@ -688,16 +582,12 @@ decomposition:
       model: "gemini-3.1-pro-preview"
       thinking_level: "HIGH"        # API track only; omit for saved Google login
 
-    verdict:
-      provider: "dsh"
-      model: "deepseek-reasoner"    # overrides global dsh.model
-
     # Falls back entirely to global codex defaults
     structural_verifier:
       provider: "codex"
 ```
 
-The override knobs are provider-specific: `model` for all four; `reasoning_effort` for Codex; `thinking_level` / `thinking_budget` for Gemini. For Claude, the **auth mode** (subscription / api_key / bedrock) stays global (controlled by `claude.provider`); only the `model` string can be overridden per agent. For dsh, `model` and `profile` can be overridden per agent; `permission_mode` stays global.
+The override knobs are provider-specific: `model` for all three; `reasoning_effort` for Codex; `thinking_level` / `thinking_budget` for Gemini. For Claude, the **auth mode** (subscription / api_key / bedrock) stays global (controlled by `claude.provider`); only the `model` string can be overridden per agent.
 
 The same dict shape applies to:
 
@@ -765,7 +655,6 @@ No agent framework is used. All model calls are subprocesses:
 - **Claude:** `claude -p --output-format json --model <model> <prompt>`
 - **Codex:** `codex --search -m <model> exec --json -C <dir> <prompt>`
 - **Gemini:** `gemini -m <model> -o json -p <prompt>`
-- **DeepSeek Harness:** `dsh --profile headless --json`, with the prompt on stdin
 
 Each call is wrapped in `asyncio.run_in_executor` so the event loop stays non-blocking. Token usage from each call is parsed from JSON stdout and tracked in `TOKEN_USAGE.md` and `token_usage.json`.
 
