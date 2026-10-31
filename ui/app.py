@@ -19,7 +19,7 @@ from utils import (
     write_file,
 )
 from config_panel import render_config_panel
-from progress_monitor import render_progress, scan_progress
+from progress_monitor import render_progress, scan_progress, format_age
 from process_manager import (
     start_pipeline,
     kill_pipeline,
@@ -239,6 +239,9 @@ def _status_summary(scan: dict) -> str:
     )
     if coord:
         parts.append(coord)
+    activity = scan.get("activity") or {}
+    if activity.get("stale"):
+        parts.append(f"no output for {format_age(activity['age_seconds'])}")
     return " — ".join(parts)
 
 

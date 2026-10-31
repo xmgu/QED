@@ -2,6 +2,7 @@
 
 import os
 import re
+import time
 
 import streamlit as st
 
@@ -23,6 +24,63 @@ from utils import (
     read_file,
     file_nonempty,
 )
+
+
+# ---------------------------------------------------------------------------
+# Activity
+# ---------------------------------------------------------------------------
+
+#: The run is reported as possibly stalled when nothing in the output
+#: directory has changed for this long. A single agent call has been
+#: observed to take ten minutes, so the threshold sits well above that:
+#: this is a hint to look at the log, not a verdict that the run died.
+STALE_AFTER_SECONDS = 15 * 60
+
+
+def scan_activity(output_dir: str) -> dict:
+    """Judge whether the pipeline is still producing output.
+
+    ``STATUS.md`` is rewritten only when the pipeline moves from one
+    agent to the next, so it says nothing about what happens *during* a
+    call -- and a call has been observed to take ten minutes. The newest
+    file in the output directory is a better signal: it moves whenever
+    an agent writes a product or the pipeline records a step.
+
+    Returns the age of the newest file, and whether that age exceeds
+    :data:`STALE_AFTER_SECONDS`.
+    """
+    result = {
+        "last_activity": 0.0,
+        "last_activity_file": "",
+        "age_seconds": 0.0,
+        "stale": False,
+        "file_count": 0,
+    }
+    if not os.path.isdir(output_dir):
+        return result
+
+    newest = 0.0
+    newest_rel = ""
+    count = 0
+    for root, _dirs, files in os.walk(output_dir):
+        for name in files:
+            path = os.path.join(root, name)
+            try:
+                mtime = os.path.getmtime(path)
+            except OSError:
+                continue
+            count += 1
+            if mtime > newest:
+                newest = mtime
+                newest_rel = os.path.relpath(path, output_dir)
+
+    result["file_count"] = count
+    if newest:
+        result["last_activity"] = newest
+        result["last_activity_file"] = newest_rel
+        result["age_seconds"] = max(0.0, time.time() - newest)
+        result["stale"] = result["age_seconds"] > STALE_AFTER_SECONDS
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -104,6 +162,13 @@ def scan_progress(output_dir: str) -> dict:
         "token_usage": None,
         "final_proof": "",
         "failure_analysis": "",
+        "activity": {
+            "last_activity": 0.0,
+            "last_activity_file": "",
+            "age_seconds": 0.0,
+            "stale": False,
+            "file_count": 0,
+        },
     }
 
     if not os.path.isdir(output_dir):
@@ -136,6 +201,7 @@ def scan_progress(output_dir: str) -> dict:
     result["failure_analysis"] = read_file(
         os.path.join(decomp_root(output_dir), "failure_analysis.md")
     )
+    result["activity"] = scan_activity(output_dir)
 
     # Stage classification
     if result["summary_complete"]:
@@ -295,6 +361,59 @@ def _render_run_config(output_dir: str) -> None:
             "Edits made in the sidebar after the run started are NOT reflected here."
         )
         st.code(content, language="yaml")
+
+
+def format_age(seconds: float) -> str:
+    """Render an age in a form that stays readable past an hour."""
+    minutes = seconds / 60.0
+    if minutes < 60:
+        return f"{minutes:.0f} min"
+    hours = minutes / 60.0
+    if hours < 48:
+        return f"{hours:.0f} h"
+    return f"{hours / 24:.0f} d"
+
+
+def _render_activity(scan: dict, run_active: bool) -> None:
+    """Report how long ago the pipeline last wrote something.
+
+    A run that is alive but no longer producing output is the case this
+    exists for: the process is there, so the UI says "running", but the
+    agent may be waiting on a network that never answers.
+    """
+    activity = scan.get("activity") or {}
+    if not activity.get("last_activity"):
+        return
+
+    age = format_age(activity["age_seconds"])
+    name = activity["last_activity_file"]
+
+    if not run_active:
+        return
+
+    if activity["stale"]:
+        st.warning(
+            f"No new output for **{age}** (last write: `{name}`). "
+            f"The agent may be stalled -- check the pipeline log below."
+        )
+    else:
+        st.caption(f"Last output {age} ago (`{name}`)")
+
+
+def _render_pipeline_log(output_dir: str) -> None:
+    """Show the tail of the pipeline's own output.
+
+    The retry notices, the CLI exit codes and the stderr of a failed
+    call all land in this file and nowhere else, so it is the only place
+    the cause of a stopped run can be read.
+    """
+    path = os.path.join(output_dir, "pipeline_stdout.log")
+    content = _tail_file(path, max_bytes=60_000, max_lines=300)
+    if not content.strip():
+        return
+    rel = _file_link(path, output_dir)
+    with st.expander(f"Pipeline Log (tail)  `{rel}`", expanded=False):
+        st.code(content, language="text")
 
 
 # ---------------------------------------------------------------------------
@@ -580,8 +699,10 @@ def render_progress(output_dir: str, run_active: bool = False) -> dict:
 
     _render_run_config(output_dir)
     _render_stage_indicator(scan)
+    _render_activity(scan, run_active)
     _render_metrics(scan)
     _render_status_and_history(output_dir)
+    _render_pipeline_log(output_dir)
     _render_survey(output_dir, scan)
     _render_decomposition_tree(scan, output_dir)
     _render_final(output_dir, scan)
