@@ -19,7 +19,6 @@ from compat import read_text, write_text  # noqa: E402
 
 UI_DIR = os.path.dirname(os.path.abspath(__file__))
 PROJECT_ROOT = os.path.dirname(UI_DIR)
-RUN_SH = os.path.join(PROJECT_ROOT, "run.sh")
 HUMAN_HELP_DIR = os.path.join(PROJECT_ROOT, "human_help")
 DEFAULT_OUTPUT_ROOT = os.path.join(UI_DIR, "proof_runs")
 ACTIVE_CONFIG_PATH = os.path.join(PROJECT_ROOT, ".config_run_active.yaml")

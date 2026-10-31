@@ -11,15 +11,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
 
 from compat import (  # noqa: E402
     IS_WINDOWS,
-    find_bash,
     kill_process_tree,
     spawn_kwargs,
-    to_posix_path,
 )
 
 from utils import (
     PROJECT_ROOT,
-    RUN_SH,
     ACTIVE_CONFIG_PATH,
     save_config,
     is_survey_complete,
@@ -45,14 +42,12 @@ def start_pipeline(
     """Start the pipeline as a background subprocess.
 
     Writes *config* to ``.config_run_active.yaml`` at project root, then
-    invokes ``run.sh <problem_file> <output_dir> <config_path>``. stdout
+    runs ``code/run.py <problem_file> <output_dir> <config_path>``. stdout
     and stderr are redirected to ``<output_dir>/pipeline_stdout.log``.
 
-    On Windows the shell entry point is invoked through a Git Bash that is
-    resolved explicitly -- a bare ``"bash"`` would resolve to the WSL
-    launcher in ``System32`` and fail. Every path handed to the shell uses
-    forward slashes, because bash re-parses a backslash path as a word
-    whose escape sequences eat the separators.
+    The entry point is a Python script rather than a shell script, so
+    the same code works on every platform and no path has to survive a
+    shell's own parsing.
     """
     save_config(config, ACTIVE_CONFIG_PATH)
     config_abs = os.path.abspath(ACTIVE_CONFIG_PATH)
@@ -65,25 +60,13 @@ def start_pipeline(
     env = os.environ.copy()
     env.setdefault("QED_PYTHON", sys.executable)
 
-    if IS_WINDOWS:
-        bash = find_bash()
-        if bash is None:
-            log_fh.close()
-            raise RuntimeError(
-                "No usable bash found on this system. Install Git for Windows "
-                "(https://git-scm.com/download/win), or set the QED_BASH "
-                "environment variable to the full path of bash.exe."
-            )
-        _verify_bash(bash, log_fh)
-        argv = [
-            bash,
-            to_posix_path(RUN_SH),
-            to_posix_path(problem_abs),
-            to_posix_path(output_abs),
-            to_posix_path(config_abs),
-        ]
-    else:
-        argv = ["bash", RUN_SH, problem_abs, output_abs, config_abs]
+    argv = [
+        sys.executable,
+        os.path.join(PROJECT_ROOT, "code", "run.py"),
+        problem_abs,
+        output_abs,
+        config_abs,
+    ]
 
     proc = subprocess.Popen(
         argv,
@@ -97,50 +80,6 @@ def start_pipeline(
     global _active_process
     _active_process = proc
     return proc
-
-
-def _verify_bash(bash: str, log_fh) -> None:
-    """Check that *bash* can actually run the project's shell entry point.
-
-    A WSL ``bash.exe`` accepts any command line and then fails later with a
-    confusing message such as ``/bin/bash: D:WorkbuddyproofqedQEDrun.sh:
-    No such file or directory`` -- the Windows path has been re-parsed as a
-    POSIX word whose escape sequences ate the separators. Probing the shell
-    up front turns that into an actionable error at the click of *Run*.
-    """
-    try:
-        probe = subprocess.run(
-            [bash, "-c", "echo QED_BASH_OK"],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            encoding="utf-8",
-            errors="replace",
-            timeout=30,
-        )
-    except (OSError, subprocess.SubprocessError) as exc:
-        log_fh.close()
-        raise RuntimeError(
-            f"The bash at '{bash}' could not be started: {exc}\n\n"
-            "This is usually the WSL launcher in C:\\Windows\\System32, which "
-            "is not a real shell for Windows paths. Install Git for Windows "
-            "and set QED_BASH to its bash.exe, e.g.\n"
-            "  setx QED_BASH \"C:\\Program Files\\Git\\bin\\bash.exe\""
-        ) from exc
-
-    ok = probe.returncode == 0 and "QED_BASH_OK" in (probe.stdout or "")
-    if ok:
-        return
-    detail = (probe.stderr or probe.stdout or "").strip()[:300]
-    log_fh.close()
-    raise RuntimeError(
-        f"The bash at '{bash}' cannot run this project's scripts "
-        f"(exit code {probe.returncode}).\n"
-        f"{detail}\n\n"
-        "This is usually the WSL launcher in C:\\Windows\\System32, which is "
-        "not a real shell for Windows paths. Install Git for Windows and set "
-        "QED_BASH to its bash.exe, e.g.\n"
-        "  setx QED_BASH \"C:\\Program Files\\Git\\bin\\bash.exe\""
-    )
 
 
 def kill_pipeline(proc: subprocess.Popen | None) -> None:

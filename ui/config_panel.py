@@ -252,50 +252,6 @@ def _agent_block(name: str, agent_cfg: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Shell status
-# ---------------------------------------------------------------------------
-
-def _render_shell_status() -> None:
-    """Show which shell will run ``run.sh`` on Windows.
-
-    The pipeline entry point is a shell script. On Windows the launcher
-    must be a real Git Bash / MSYS2 shell -- the ``bash.exe`` in
-    ``C:\\Windows\\System32`` is the WSL stub and cannot execute the
-    project's scripts. Surfacing the resolved shell turns a cryptic
-    "No such file or directory" into an actionable message.
-    """
-    if os.name != "nt":
-        return
-
-    import sys
-
-    sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(
-        os.path.abspath(__file__))), "code"))
-    try:
-        from compat import describe_bash, find_bash
-        bash = find_bash()
-        description = describe_bash(bash)
-    except Exception:
-        return
-
-    with st.sidebar.expander("Shell", expanded=False):
-        st.caption("Shell used to launch `run.sh`:")
-        st.code(description, language="text")
-        if bash is None:
-            st.error(
-                "No usable bash found. Install Git for Windows, or set the "
-                "QED_BASH environment variable to the full path of bash.exe."
-            )
-        elif "WSL" in description:
-            st.error(
-                "The resolved bash is the WSL launcher, which cannot run "
-                "this project's scripts. Set QED_BASH to a Git Bash binary."
-            )
-        else:
-            st.success("Shell is ready.")
-
-
-# ---------------------------------------------------------------------------
 # Main panel
 # ---------------------------------------------------------------------------
 
@@ -309,9 +265,6 @@ def render_config_panel() -> dict:
     gemini_block = _render_gemini_block(cfg.get("gemini", {}))
 
     st.sidebar.caption("Prover mode: decomposition (only mode supported)")
-
-    # --- Shell used to launch the pipeline ---
-    _render_shell_status()
 
     # --- Decomposition agents ---
     decomp_cfg = cfg.get("decomposition", {})

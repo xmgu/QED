@@ -19,7 +19,7 @@
 
 </details>
 
-QED is a multi-agent pipeline that takes a mathematical problem statement in LaTeX and produces a rigorous natural-language proof. The pipeline orchestrates Codex (and optionally Claude and Gemini) through their respective CLIs via bash subprocesses (minimal extra dependencies required besides the coding CLI themselves). QED conducts the literature survey, decomposes the problem, executes the plan and verifies the proof. So far, QED has produced 5 works in the area of probabilty, PDE, algebraic geometry and inverse problems that are original and nontrivial according to expert evaluations.
+QED is a multi-agent pipeline that takes a mathematical problem statement in LaTeX and produces a rigorous natural-language proof. The pipeline orchestrates Codex (and optionally Claude and Gemini) through their respective CLIs (minimal extra dependencies required besides the coding CLI themselves). QED conducts the literature survey, decomposes the problem, executes the plan and verifies the proof. So far, QED has produced 5 works in the area of probabilty, PDE, algebraic geometry and inverse problems that are original and nontrivial according to expert evaluations.
 
 <picture>
   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/svg?repos=proofQED/QED&type=date&theme=dark&sealed_token=xdfol3Ik3lUq8TNJ73_UIHaIytdiz1R2bitdw_IC6AwHpxre4FD1ddUQd4XHiUB5Z5lbi2g-MEkz20sse5XE0n_31K4sg9RcvTCUU_MrfQ5Zv5JukB28XHTzKs1fUY_mL2j5Xq-Yb6PvMijRFwNIOmtXLenxGBBQh0idHThC3VoWy9BV5smUAyPwc70y" />
@@ -221,7 +221,7 @@ For either option, point the launchers at the active environment:
 export QED_PYTHON="$(python -c 'import sys; print(sys.executable)')"
 ```
 
-In each new terminal or when switching environments, activate your chosen environment (`source .venv/bin/activate` or `conda activate agent`) and repeat the export. This ensures the terminal launchers use the selected environment even when both exist. Without `QED_PYTHON`, `run.sh` and `run_verifier.sh` prefer `.venv/bin/python`, then fall back to the Conda environment `agent`. The UI uses its own Python interpreter unless `QED_PYTHON` overrides it.
+In each new terminal or when switching environments, activate your chosen environment (`source .venv/bin/activate` or `conda activate agent`) and repeat the export. This ensures the terminal launchers use the selected environment even when both exist. Without `QED_PYTHON`, the shell wrappers prefer `.venv/bin/python`, then fall back to the Conda environment `agent`. The Python entry points and the UI use the interpreter they are running under.
 
 Then install the model CLIs you plan to use:
 
@@ -258,79 +258,51 @@ The UI uses the same `pipeline.py` under the hood, so anything you can configure
 
 ### Quick Start (Terminal — Alternative)
 
-From your activated venv or Conda environment, with `QED_PYTHON` set as above:
-
 > **First:** write your problem statement in **`problem/problem.tex`** (LaTeX format).
 
 ```bash
-bash run.sh
+python code/run.py
 ```
+
+`code/run.py` is the cross-platform entry point. It runs the smoke tests,
+copies the global human-help files into the output directory and starts
+the pipeline. Pass the problem, the output directory and the config file
+to override the defaults:
+
+```bash
+python code/run.py path/to/problem.tex path/to/output config.yaml
+```
+
+The shell wrappers (`run.sh`, `run_verifier.sh`, `clean.sh`) still exist
+and forward to the Python entry points, so `bash run.sh` keeps working.
 
 #### Running on native Windows
 
-The pipeline runs on Windows as well as macOS/Linux. Two things to know:
-
-1. **Git Bash is required.** The entry point is a shell script, so Git for
-   Windows (or MSYS2) must be installed. Several programs answer to the
-   name `bash.exe` on Windows, and only one of them works here:
-
-   | Path | What it is | Usable |
-   |------|------------|--------|
-   | `C:\Windows\System32\bash.exe` | WSL launcher stub | no |
-   | `%LOCALAPPDATA%\Microsoft\WindowsApps\bash.exe` | WSL App Execution Alias (0-byte reparse point) | no |
-   | `...\Git\bin\bash.exe` | Git Bash | **yes** |
-
-   The WSL stubs re-parse a Windows path as a POSIX word, so the
-   backslashes are consumed as escapes and the script is looked up under
-   a mangled name such as `D:WorkbuddyproofqedQEDrun.sh` — reported as
-   `No such file or directory`.
-
-   The UI locates a working shell automatically: it skips the WSL stubs,
-   scans the usual Git / MSYS2 / Scoop install locations, and *probes*
-   each candidate to confirm it can resolve a Windows path. The sidebar
-   shows the resolved shell under **Shell**.
-
-   To override the choice, set `QED_BASH` to the full path of `bash.exe`:
-
-   ```powershell
-   setx QED_BASH "C:\Program Files\Git\bin\bash.exe"
-   ```
-
-   If Git is installed through Scoop, the path is versioned — use the
-   stable `current` symlink:
-
-   ```powershell
-   setx QED_BASH "D:\Scoop\apps\git\current\bin\bash.exe"
-   ```
-
-2. **Use the Streamlit UI rather than the shell scripts** if you prefer.
-   `python -m streamlit run ui/app.py` handles process launch, tree
-   termination, path conversion and interpreter detection for you on every
-   platform.
-
-From PowerShell or cmd.exe, invoke the script through Git Bash explicitly.
-Backslash paths are accepted — the script normalizes them:
+The pipeline runs on Windows as well as macOS/Linux, and no shell is
+required:
 
 ```powershell
-& "C:\Program Files\Git\bin\bash.exe" "D:\path\to\QED\run.sh"
+python code\run.py
 ```
 
-If you keep the shell in Git Bash, use forward slashes (or just `cd` into
-the project first and call `bash run.sh`):
+The entry point is a Python script, which means no path ever has to
+survive a shell's own parsing — the recurring source of a Windows path
+such as `D:\path\to\run.sh` being read as one word with the separators
+eaten as escape sequences.
 
-```bash
-bash /d/path/to/QED/run.sh
+The interpreter is the one running the script, so a virtual environment
+in the project root is picked up without any configuration. The shell
+wrappers still detect an interpreter in this order: `$QED_PYTHON`, then
+`.venv/bin/python` (macOS/Linux), then `.venv/Scripts/python.exe`
+(Windows), then the `agent` Conda environment.
+
+The Streamlit UI starts the pipeline through the same Python entry
+point, and handles process launch, tree termination and interpreter
+detection for you on every platform:
+
+```powershell
+python -m streamlit run ui/app.py
 ```
-
-The scripts detect the interpreter in this order: `$QED_PYTHON`, then
-`.venv/bin/python` (macOS/Linux), then `.venv/Scripts/python.exe` (Windows),
-then the `agent` Conda environment. A virtual environment in the project
-root is therefore picked up without any configuration.
-
-The scripts also avoid depending on Git's coreutils (`dirname`, `cp`) — a
-Git Bash launched from PowerShell inherits the Windows `PATH`, which does
-not include `/usr/bin`. Any file copying falls back to the Python
-interpreter when `cp` is unavailable.
 
 The input file should be a LaTeX problem statement:
 
@@ -356,7 +328,7 @@ Run this from the repository root with your venv or Conda environment activated:
 python code/smoke_test.py --config config.yaml
 ```
 
-The live check requires authenticated model CLIs and consumes a small amount of model usage. It also runs automatically before `run.sh` starts the proof pipeline. A successful check requires the expected assistant response; CLI error output does not count as success.
+The live check requires authenticated model CLIs and consumes a small amount of model usage. It also runs automatically before `code/run.py` starts the proof pipeline. A successful check requires the expected assistant response; CLI error output does not count as success.
 
 ## Standalone Proof Verifier
 
@@ -678,7 +650,7 @@ The proof search agent is required to use two tag formats that the verifier chec
 
 ### How Models are Called
 
-No agent framework is used. All model calls are bash subprocesses:
+No agent framework is used. All model calls are subprocesses:
 
 - **Claude:** `claude -p --output-format json --model <model> <prompt>`
 - **Codex:** `codex --search -m <model> exec --json -C <dir> <prompt>`
@@ -699,7 +671,7 @@ If the pipeline is interrupted (crash, Ctrl-C, machine shutdown), just re-run wi
 
 ```bash
 # Same command — the pipeline detects prior progress automatically
-bash run.sh /path/to/problem.tex /path/to/output
+python code/run.py /path/to/problem.tex /path/to/output
 ```
 
 The pipeline will:
@@ -759,10 +731,12 @@ The hierarchy reflects the three retry levels: `attempt_N` (REWRITE) → `revisi
 ```
 QED/
 ├── config.yaml                        # Pipeline configuration
-├── run.sh                             # Entry point (smoke test + pipeline)
-├── clean.sh                           # Cleanup script
+├── run.sh                             # Shell wrapper for code/run.py
+├── clean.sh                           # Shell wrapper for code/clean.py
 │
 ├── code/
+│   ├── run.py                         # Entry point (smoke test + pipeline)
+│   ├── clean.py                       # Removes the generated output directories
 │   ├── pipeline.py                    # Main orchestrator
 │   ├── model_runner.py                # Async wrappers for Claude, Codex, Gemini CLIs
 │   ├── decomposition_prover.py        # Decomposition-based prover
