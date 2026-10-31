@@ -691,6 +691,79 @@ Each pipeline stage writes logs to its own directory under `<output>/`:
 | `TOKEN_USAGE.md` | `<output>/` root | Running total of tokens used, broken down per call and per provider. Updated after every agent call. |
 | `STATUS.md` | `decomposition/` | Current decomposition state — attempt, revision, proof number, current activity. |
 | `log.txt` | `decomposition/` | Timeline of all decomposition agent calls. |
+| `pipeline_stdout.log` | `<output>/` root | Everything the pipeline and the model CLIs printed, including retry notices and CLI exit codes. Shown in the UI under **Pipeline Log (tail)**. |
+
+### Telling a live run from a stalled one
+
+`STATUS.md` is rewritten only when the pipeline moves from one agent to
+the next, so it says nothing about what happens *during* a call — and a
+single call has been observed to take ten minutes. The UI therefore
+watches the newest file in the output directory instead, and reports how
+long ago that was:
+
+> No new output for **40 min** (last write: `structural_verification.md`).
+> The agent may be stalled — check the pipeline log below.
+
+Fifteen minutes without a write is what triggers the notice. It is a
+hint rather than a verdict: the file that was written last is named, so
+it is clear what the run was doing when it went quiet. The elapsed time
+also appears in the status line of a run that has stopped, which is how
+you tell "finished three hours ago" from "finished just now".
+
+## Known Issues Fixed Here
+
+Two defects were present in the original code. Both are recorded here
+because their symptoms point away from their causes, and both are easy
+to reintroduce.
+
+### LaTeX in the decomposition YAML
+
+The decomposition prompt showed the model how to write its
+self-critique — with double-quoted strings:
+
+```yaml
+contradiction_checks:
+  - "Verified STEP2 does not contradict Theorem X from literature"
+```
+
+A backslash starts an escape inside a double-quoted YAML scalar, so a
+critique that mentions `\mathbb{E}` or a set difference `A\B` did not
+parse. The parser was a bare `yaml.safe_load` with no handling for it,
+at all four places that read the file.
+
+The trigger is the field's own semantics: `plausibility_issues`,
+`contradiction_checks` and `refinements_made` exist to record concrete
+mathematics, and concrete mathematics carries LaTeX. The template's
+other free-text field used a block scalar, which is safe — the three
+high-risk ones did not.
+
+What happened then was not a failed run but a lost one: the
+decomposition could not be read back, so the pipeline saw no progress
+and started again from attempt 1, with the tokens already spent gone.
+
+The parser now retries with the offending backslashes doubled, and only
+inside double-quoted scalars and only where they do not already start a
+valid escape — `\n` and `\t` keep their meaning. The prompt asks for
+block scalars instead.
+
+### Ctrl+C did not stop the pipeline
+
+The model CLIs were called through `run_in_executor(None, ...)`, the
+default thread pool. Its workers are not daemon threads, and the
+interpreter joins them on the way out — so an in-flight model call kept
+the process alive after Ctrl+C, for as long as the call took. There was
+no signal handler either, so closing the UI left the pipeline running
+and spending tokens.
+
+The calls now run on daemon threads, which the interpreter does not
+wait for, and the UI terminates the pipeline on `atexit` and on
+SIGINT/SIGTERM.
+
+Note for Windows: `CREATE_NEW_PROCESS_GROUP` is *not* the counterpart of
+POSIX `setsid` here. It disables CTRL+C for every process in the new
+group, so a pipeline started with it ignores Ctrl+C entirely. The tree
+is terminated with `taskkill /T` instead, which needs no process group
+of its own.
 
 ## Output Structure
 
