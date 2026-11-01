@@ -322,6 +322,8 @@ async def run_codex_agent(
     input_tokens = 0
     output_tokens = 0
     json_parse_error = None
+    turn_completed = False
+    messages_seen = 0
 
     try:
         lines = result.stdout.strip().split("\n")
@@ -331,8 +333,14 @@ async def run_codex_agent(
             if event.get("type") == "item.completed":
                 item = event.get("item", {})
                 if item.get("type") == "agent_message":
+                    # Only the last message survives. Normally that is the
+                    # final answer; when a session is cut off it is a
+                    # mid-work narration, which callers must not mistake
+                    # for a finished artifact.
                     response = item.get("text", "")
+                    messages_seen += 1
             elif event.get("type") == "turn.completed":
+                turn_completed = True
                 usage = event.get("usage", {})
                 input_tokens += usage.get("input_tokens", 0)
                 output_tokens += usage.get("output_tokens", 0)
@@ -344,6 +352,19 @@ async def run_codex_agent(
                 logger.log(f"[Codex] Raw stdout (first 1000 chars): {result.stdout.strip()[:1000]}")
         # JSON mode must produce an assistant message, not raw CLI diagnostics.
         response = ""
+
+    # A turn that produced messages but never emitted turn.completed ended
+    # early: the CLI hit its context or output ceiling, crashed, or was killed.
+    # token_usage then records 0/0 (no usage event), and the surviving
+    # response is whatever the last message happened to be.
+    if response.strip() and not turn_completed:
+        if logger:
+            logger.log(
+                f"[Codex] Warning: turn did not complete ({messages_seen} "
+                "message(s) seen, no turn.completed event) — the captured "
+                "response is the last message emitted, not necessarily a "
+                "finished answer"
+            )
 
     # The Codex CLI sometimes exits non-zero (e.g. "Reading additional input
     # from stdin..." warning → exit code 1) even when it produced a valid

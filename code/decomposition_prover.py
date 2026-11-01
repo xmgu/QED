@@ -173,6 +173,42 @@ def _repair_yaml_escapes(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Proof document validation
+# ---------------------------------------------------------------------------
+
+_STEP_HEADING_RE = re.compile(r"^#{1,6}\s*STEP\s*\d", re.MULTILINE | re.IGNORECASE)
+_PROOF_TITLE_RE = re.compile(r"^#{1,6}\s*(?:The\s+)?Proof\b", re.MULTILINE | re.IGNORECASE)
+
+# A document this long that calls itself a proof is accepted even without STEP
+# headings, to tolerate the prover drifting from the mandated section layout.
+_MIN_PROOF_CHARS = 1500
+
+
+class ProofNotProduced(RuntimeError):
+    """The prover finished without writing a proof document.
+
+    Raised when the agent leaves ``proof.md`` unwritten *and* its chat response
+    is not a proof either. This is what an interrupted session looks like: the
+    agent narrates what it is about to do ("Let me write the proof next"), the
+    session ends before the write, and the last message is all that survives.
+    """
+
+
+def looks_like_proof(text: str) -> bool:
+    """Whether *text* is a proof document rather than incidental prose.
+
+    The prover prompt requires one ``### STEP_ID:`` heading per decomposition
+    step, and structural verifier Phase 4 keys off exactly that structure, so a
+    response containing no such heading at all is narration, not a proof.
+    """
+    if not text or not text.strip():
+        return False
+    if _STEP_HEADING_RE.search(text):
+        return True
+    return bool(_PROOF_TITLE_RE.search(text)) and len(text) >= _MIN_PROOF_CHARS
+
+
+# ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
 
@@ -1011,17 +1047,42 @@ async def run_single_prover(
     if decomp_logger:
         resp_path = os.path.join(proof_dir, "prover_response.md")
         decomp_logger.save_agent_output(response, resp_path)
-        decomp_logger.log_agent_result("single_prover", "Proof written")
 
     # Read the file the agent wrote via tool call
     content = read_file(output_file)
     if not content:
-        # Agent failed to write the file — fall back to response text
-        content = response
-        if "# Proof" in content:
-            proof_start = content.find("# Proof")
-            if proof_start >= 0:
-                content = content[proof_start:]
+        # The agent never wrote the file. Its chat response is a usable fallback
+        # only if it actually contains a proof.
+        #
+        # When a session is cut off mid-work -- context or output limit, CLI
+        # crash, hard kill -- the last message is a one-line narration of the
+        # next action, e.g. "Now I have a complete understanding. Let me write a
+        # quick scratchpad note and then create the fixed proof." Promoting that
+        # to proof.md spends an entire proof attempt on something that cannot
+        # pass verification, and save_proof() also mirrors it into the run's
+        # top-level proof.md, so a dead run leaves narration standing in as its
+        # final result.
+        if looks_like_proof(response):
+            proof_start = response.find("# Proof")
+            content = response[proof_start:] if proof_start >= 0 else response
+        else:
+            write_file(
+                os.path.join(proof_dir, "prover_rejected.md"), response or ""
+            )
+            if decomp_logger:
+                decomp_logger.log_agent_result(
+                    "single_prover",
+                    "No proof produced: the agent wrote no file and its "
+                    f"response ({len(response or '')} chars) is not a proof",
+                )
+            raise ProofNotProduced(
+                f"The prover wrote no {os.path.basename(output_file)} and its "
+                f"response ({len(response or '')} chars) contains no proof "
+                "structure. Its response was:\n\n" + (response or "").strip()[:600]
+            )
+
+    if decomp_logger:
+        decomp_logger.log_agent_result("single_prover", "Proof written")
 
     # Save the proof
     state.save_proof(content)
@@ -1696,6 +1757,7 @@ async def run_decomposition_prover(
             proof_dir = state.get_proof_dir()
             os.makedirs(proof_dir, exist_ok=True)
             proof_file = os.path.join(proof_dir, "proof.md")
+            proof_missing = ""  # set when the prover produced no document
 
             # === Step 2: Run single prover ===
             if resume_point in ("fresh", "decompose", "decompose_revise", "prove"):
@@ -1708,10 +1770,52 @@ async def run_decomposition_prover(
                     recent_activity=f"Writing proof (proof {state.proof})"
                 )
 
-                proof = await run_single_prover(
+                try:
+                    proof = await run_single_prover(
+                        state=state,
+                        problem_file=problem_file,
+                        related_work_file=related_work_file,
+                        prompts_dir=prompts_dir,
+                        config=config,
+                        claude_opts=claude_opts,
+                        decomp_logger=decomp_logger,
+                        tracker=tracker,
+                    )
+                except ProofNotProduced as exc:
+                    proof_missing = str(exc)
+
+            resume_point = "verify_structural"  # Normal flow continues to verification
+
+            if proof_missing:
+                # Nothing to verify. The prover never wrote a document, so a
+                # verification call would spend a full model round-trip
+                # describing a one-line narration as a mathematical failure,
+                # and the regulator would then reason about a report with no
+                # substance behind it. Give the regulator the cause instead.
+                decomp_logger.log(
+                    "Skipping verification: the prover produced no proof document"
+                )
+                structural_report_file = ""
+                structural_verdict = "CONTINUE"
+                verification_feedback = (
+                    "No verification report exists because the prover produced "
+                    "no proof document to verify. It neither wrote proof.md nor "
+                    "returned a response containing any STEP heading -- the "
+                    "signature of a session that ended before the write (context "
+                    "or output limit, CLI crash, or kill).\n\n" + proof_missing
+                )
+            else:
+                # === Step 3: Structural verification ===
+                decomp_logger.log("Running structural verification")
+                decomp_logger.update_status(
+                    state="VERIFYING_STRUCTURAL",
+                    recent_activity="Running structural verification (Phases 1-5)"
+                )
+
+                structural_report_file = await run_structural_verification(
                     state=state,
                     problem_file=problem_file,
-                    related_work_file=related_work_file,
+                    proof_file=proof_file,
                     prompts_dir=prompts_dir,
                     config=config,
                     claude_opts=claude_opts,
@@ -1719,44 +1823,25 @@ async def run_decomposition_prover(
                     tracker=tracker,
                 )
 
-            resume_point = "verify_structural"  # Normal flow continues to verification
+                # === Step 3b: Structural verdict ===
+                decomp_logger.log("Running structural verdict check...")
+                structural_verdict = await run_verdict(
+                    state=state,
+                    structural_report_file=structural_report_file,
+                    prompts_dir=prompts_dir,
+                    config=config,
+                    claude_opts=claude_opts,
+                    mode="STRUCTURAL",
+                    decomp_logger=decomp_logger,
+                    tracker=tracker,
+                )
 
-            # === Step 3: Structural verification ===
-            decomp_logger.log("Running structural verification")
-            decomp_logger.update_status(
-                state="VERIFYING_STRUCTURAL",
-                recent_activity="Running structural verification (Phases 1-5)"
-            )
-
-            structural_report_file = await run_structural_verification(
-                state=state,
-                problem_file=problem_file,
-                proof_file=proof_file,
-                prompts_dir=prompts_dir,
-                config=config,
-                claude_opts=claude_opts,
-                decomp_logger=decomp_logger,
-                tracker=tracker,
-            )
-
-            # === Step 3b: Structural verdict ===
-            decomp_logger.log("Running structural verdict check...")
-            structural_verdict = await run_verdict(
-                state=state,
-                structural_report_file=structural_report_file,
-                prompts_dir=prompts_dir,
-                config=config,
-                claude_opts=claude_opts,
-                mode="STRUCTURAL",
-                decomp_logger=decomp_logger,
-                tracker=tracker,
-            )
+                if structural_verdict == "CONTINUE":
+                    # Get feedback and consult regulator
+                    verification_feedback = read_file(structural_report_file)
+                    decomp_logger.log("Structural verification FAILED. Consulting regulator...")
 
             if structural_verdict == "CONTINUE":
-                # Get feedback and consult regulator
-                verification_feedback = read_file(structural_report_file)
-                decomp_logger.log("Structural verification FAILED. Consulting regulator...")
-
                 decision = await run_regulator(
                     state=state,
                     verification_report=verification_feedback,
