@@ -19,6 +19,7 @@ This is the Stage 1 prover orchestrated by pipeline.py.
 import asyncio
 import json
 import os
+import re
 import yaml
 from datetime import datetime
 from pathlib import Path
@@ -44,7 +45,8 @@ DEFAULT_MODELS = {
     "regulator": {"provider": "codex"},
     "structural_verifier": {"provider": "codex"},
     "detailed_verifier": {"provider": "codex"},
-    "verdict": {"provider": "codex"},
+    # NOTE: no "verdict" role. Verdicts are computed in code (see
+    # parse_report_verdict / compute_verdict), not by a model.
 }
 
 
@@ -168,28 +170,6 @@ def _repair_yaml_escapes(text: str) -> str:
         i += 1
 
     return "".join(out)
-
-
-def parse_verdict(response: str) -> str:
-    """Extract PASS or FAIL from verifier response.
-
-    NOTE: This function is currently unused. The main orchestration loop uses
-    run_verdict() instead, which returns DONE/CONTINUE. Kept for potential
-    future use or alternative parsing needs.
-    """
-    response_upper = response.upper()
-    # Look for verdict in markdown header
-    if "### VERDICT: PASS" in response_upper or "**VERDICT**: PASS" in response_upper:
-        return "PASS"
-    if "### VERDICT: FAIL" in response_upper or "**VERDICT**: FAIL" in response_upper:
-        return "FAIL"
-    # Look for standalone PASS/FAIL
-    if "VERDICT: PASS" in response_upper:
-        return "PASS"
-    if "VERDICT: FAIL" in response_upper:
-        return "FAIL"
-    # Default to FAIL if unclear
-    return "FAIL"
 
 
 # ---------------------------------------------------------------------------
@@ -715,8 +695,7 @@ def detect_decomposition_resume(output_dir: str) -> dict:
 
     # Check if detailed verification exists and passed
     if _file_nonempty(detailed_path):
-        content = read_file(detailed_path)
-        if "OVERALL VERDICT: PASS" in content.upper():
+        if parse_report_verdict(detailed_path) == "PASS":
             result["resume_point"] = "done"
             return result
         # Detailed failed - check if regulator was called
@@ -731,8 +710,7 @@ def detect_decomposition_resume(output_dir: str) -> dict:
 
     # Check if structural verification exists
     if _file_nonempty(structural_path):
-        content = read_file(structural_path)
-        if "OVERALL VERDICT: PASS" in content.upper():
+        if parse_report_verdict(structural_path) == "PASS":
             # Structural passed, need detailed
             result["resume_point"] = "verify_detailed"
             return result
@@ -1318,6 +1296,63 @@ async def run_detailed_verification(
     return output_file
 
 
+# ---------------------------------------------------------------------------
+# Verification verdict — deterministic, code-only
+# ---------------------------------------------------------------------------
+#
+# The verdict used to be delegated to a model (prompt now archived at
+# prompts/decomposition-prover/archive/verdict_proof.md). That task reduces to
+# reading one well-defined field per report and comparing it to PASS, so it is
+# computed in code instead. This removes a per-attempt model round-trip and,
+# more importantly, removes the possibility of a model accepting a report that
+# does not say PASS.
+
+_VERDICT_RE = re.compile(
+    r"overall\s+(?:structural\s+)?verdict\s*:?\s*\**\s*(PASS|FAIL)"
+    r"(?!\s*/\s*(?:PASS|FAIL)\s*\])",   # never accept an un-filled [PASS/FAIL] slot
+    re.IGNORECASE,
+)
+
+
+def parse_report_verdict(path: str) -> str:
+    """Extract the verdict from a verification report.
+
+    Returns one of:
+        "PASS"        — report explicitly says Overall Verdict: PASS
+        "FAIL"        — report explicitly says Overall Verdict: FAIL
+        "MISSING"     — path empty, file absent, or file blank
+        "UNPARSEABLE" — no verdict field found
+
+    The verdict field is emitted in the trailing Summary block, so the LAST
+    occurrence is authoritative; earlier hits may be quoted prose (e.g. a
+    detailed report citing the structural report's conclusion).
+    """
+    if not path:
+        return "MISSING"
+    text = read_file(path)          # compat.read_text returns "" when absent
+    if not text or not text.strip():
+        return "MISSING"
+    matches = _VERDICT_RE.findall(text)
+    if not matches:
+        return "UNPARSEABLE"
+    return matches[-1].upper()
+
+
+def compute_verdict(mode: str, structural_report: str,
+                    detailed_report: str = "") -> str:
+    """Return "DONE" only when every required report explicitly says PASS.
+
+    Mirrors the rules the old prompt stated: any missing, blank, unparseable or
+    failed report yields "CONTINUE"; FINAL mode additionally requires the
+    detailed report.
+    """
+    if parse_report_verdict(structural_report) != "PASS":
+        return "CONTINUE"
+    if mode.upper() == "FINAL" and parse_report_verdict(detailed_report) != "PASS":
+        return "CONTINUE"
+    return "DONE"
+
+
 async def run_verdict(
     state: DecompositionState,
     structural_report_file: str,
@@ -1329,154 +1364,38 @@ async def run_verdict(
     decomp_logger: DecompositionLogger = None,
     tracker=None,
 ) -> str:
-    """Run verdict check on verification reports.
+    """Compute the verdict on verification reports.
+
+    Kept ``async`` and with its original signature so existing call sites need
+    no change. ``prompts_dir`` / ``config`` / ``claude_opts`` / ``tracker`` are
+    no longer consumed — they are retained for compatibility only.
 
     Args:
         mode: "STRUCTURAL" to check structural only, "FINAL" to check both
         structural_report_file: Path to structural verification report
-        detailed_report_file: Path to detailed verification report (only for FINAL mode)
+        detailed_report_file: Path to detailed verification report (FINAL only)
 
     Returns "DONE" if verification passes, "CONTINUE" otherwise.
     """
-    role_cfg = get_agent_role_cfg(config, "verdict")
-    model_provider = role_cfg["provider"]
+    state_name = "VERDICT_STRUCTURAL" if mode == "STRUCTURAL" else "VERDICT_FINAL"
+    if decomp_logger:
+        decomp_logger.log(f"Verdict ({mode}): reading report files directly")
+        decomp_logger.update_status(
+            state=state_name,
+            recent_activity=f"Computing {mode.lower()} verdict from report files",
+        )
 
-    prompt = load_prompt(
-        prompts_dir,
-        "decomposition-prover/verdict_proof.md",
-        mode=mode,
-        structural_verification_file=structural_report_file,
-        detailed_verification_file=detailed_report_file if mode == "FINAL" else "",
-    )
+    structural_parsed = parse_report_verdict(structural_report_file)
+    verdict = compute_verdict(mode, structural_report_file, detailed_report_file)
 
     if decomp_logger:
-        if mode == "STRUCTURAL":
-            decomp_logger.log_agent_call(
-                "verdict", "Verdict on structural verification",
-                model_provider,
-                {"mode": mode}
-            )
-            decomp_logger.update_status(
-                state="VERDICT_STRUCTURAL",
-                recent_activity="Running structural verdict check"
-            )
-        else:
-            decomp_logger.log_agent_call(
-                "verdict", "Final verdict on verification results",
-                model_provider,
-                {"mode": mode}
-            )
-            decomp_logger.update_status(
-                state="VERDICT_FINAL",
-                recent_activity="Running final verdict check"
-            )
-
-    response = await run_model_for_agent(
-        agent_role_cfg=role_cfg,
-        prompt=prompt,
-        working_dir=state.output_dir,
-        config=config,
-        claude_opts=get_claude_opts_for_role(config, role_cfg) if model_provider == "claude" else claude_opts,
-        tracker=tracker,
-        call_name=f"verdict_{mode.lower()}",
-    )
-
-    # Parse verdict from response
-    response_upper = response.strip().upper()
-    if "DONE" in response_upper:
-        verdict = "DONE"
-    else:
-        verdict = "CONTINUE"
-
-    if decomp_logger:
+        detail = f"structural={structural_parsed}"
+        if mode.upper() == "FINAL":
+            detail += f", detailed={parse_report_verdict(detailed_report_file)}"
+        decomp_logger.log(f"Verdict ({mode}) evidence: {detail} -> {verdict}")
         decomp_logger.log_agent_result("verdict", f"{mode} verdict: {verdict}")
 
     return verdict
-
-
-async def run_proof_verification(
-    state: DecompositionState,
-    problem_file: str,
-    proof_file: str,
-    prompts_dir: str,
-    config: dict,
-    claude_opts: dict,
-    decomp_logger: DecompositionLogger = None,
-    tracker=None,
-) -> tuple[str, str]:
-    """Run full verification (structural + detailed) on the aggregated proof.
-
-    NOTE: This function is currently unused. The main orchestration loop calls
-    run_structural_verification(), run_verdict(), run_detailed_verification(),
-    and run_verdict() directly for finer control over the flow. Kept as a
-    convenience wrapper for potential future use or testing.
-
-    Returns (final_verdict, combined_feedback) where final_verdict is "DONE" or "CONTINUE"
-    and combined_feedback is the content of the verification reports for use by the
-    decomposer on the next round.
-    """
-    # Step 1: Structural verification
-    structural_report_file = await run_structural_verification(
-        state=state,
-        problem_file=problem_file,
-        proof_file=proof_file,
-        prompts_dir=prompts_dir,
-        config=config,
-        claude_opts=claude_opts,
-        decomp_logger=decomp_logger,
-        tracker=tracker,
-    )
-
-    # Step 2: Structural verdict
-    structural_verdict = await run_verdict(
-        state=state,
-        structural_report_file=structural_report_file,
-        prompts_dir=prompts_dir,
-        config=config,
-        claude_opts=claude_opts,
-        mode="STRUCTURAL",
-        decomp_logger=decomp_logger,
-        tracker=tracker,
-    )
-
-    if structural_verdict == "CONTINUE":
-        feedback = read_file(structural_report_file)
-        if decomp_logger:
-            decomp_logger.log("Structural verdict: CONTINUE — skipping detailed verification")
-        return "CONTINUE", feedback
-
-    # Step 3: Detailed verification (only if structural passed)
-    detailed_report_file = await run_detailed_verification(
-        state=state,
-        problem_file=problem_file,
-        proof_file=proof_file,
-        structural_report_file=structural_report_file,
-        prompts_dir=prompts_dir,
-        config=config,
-        claude_opts=claude_opts,
-        decomp_logger=decomp_logger,
-        tracker=tracker,
-    )
-
-    # Step 4: Final verdict
-    final_verdict = await run_verdict(
-        state=state,
-        structural_report_file=structural_report_file,
-        prompts_dir=prompts_dir,
-        config=config,
-        claude_opts=claude_opts,
-        mode="FINAL",
-        detailed_report_file=detailed_report_file,
-        decomp_logger=decomp_logger,
-        tracker=tracker,
-    )
-
-    # Combine feedback from both reports
-    structural_report = read_file(structural_report_file)
-    detailed_report = read_file(detailed_report_file)
-    combined_feedback = f"# Structural Verification\n\n{structural_report}\n\n---\n\n# Detailed Verification\n\n{detailed_report}"
-
-    return final_verdict, combined_feedback
 
 
 # ---------------------------------------------------------------------------

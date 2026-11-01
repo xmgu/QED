@@ -16,8 +16,12 @@ import yaml
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from pipeline import load_prompt, make_claude_options
-from decomposition_prover import load_prompt as decomp_load_prompt
-from compat import decode_kwargs, resolve_cli
+from decomposition_prover import (
+    load_prompt as decomp_load_prompt,
+    parse_report_verdict,
+    compute_verdict,
+)
+from compat import decode_kwargs, resolve_cli, write_text
 
 
 async def run_smoke_test(config: dict, config_path: str | None = None) -> bool:
@@ -73,7 +77,6 @@ async def run_smoke_test(config: dict, config_path: str | None = None) -> bool:
         "decomposition-prover/regulator.md",
         "decomposition-prover/proof_verify_structural.md",
         "decomposition-prover/proof_verify_detailed.md",
-        "decomposition-prover/verdict_proof.md",
     ]
     for pf in decomposition_prompt_files:
         exists = os.path.exists(os.path.join(prompts_dir, pf))
@@ -196,17 +199,6 @@ async def run_smoke_test(config: dict, config_path: str | None = None) -> bool:
     except Exception as e:
         check("regulator.md renders OK", False, str(e))
 
-    try:
-        prompt = load_prompt(
-            prompts_dir, "decomposition-prover/verdict_proof.md",
-            mode="STRUCTURAL",
-            structural_verification_file="/tmp/test_structural.md",
-            detailed_verification_file="",
-        )
-        check("verdict_proof.md (decomp) renders OK", "STRUCTURAL" in prompt)
-    except Exception as e:
-        check("verdict_proof.md (decomp) renders OK", False, str(e))
-
     # decomposition_prover.load_prompt MUST render the same output as
     # pipeline.load_prompt for the templates that the prover uses (these
     # templates rely on {{...}} escapes intended for str.format).
@@ -235,6 +227,57 @@ async def run_smoke_test(config: dict, config_path: str | None = None) -> bool:
     except Exception as e:
         check("decomposition_prover.load_prompt matches pipeline.load_prompt",
               False, str(e))
+
+    # -------------------------------------------------------
+    # Test 3c: Verdict parsing (code-only, fail-safe)
+    # -------------------------------------------------------
+    print("\n=== Test 3c: Verdict parsing (code-only) ===")
+    with tempfile.TemporaryDirectory() as td:
+        def _mk(name: str, body: str) -> str:
+            p = os.path.join(td, name)
+            write_text(p, body)
+            return p
+
+        parse_cases = [
+            ("verdict_pass.md", "## Summary\n\n### Overall Verdict: PASS\n", "PASS"),
+            ("verdict_fail.md", "## Summary\n\n### Overall Verdict: FAIL\n", "FAIL"),
+            ("verdict_bold.md", "### **Overall Verdict:** PASS\n", "PASS"),
+            ("verdict_structural.md", "### Overall Structural Verdict: PASS\n", "PASS"),
+            # The trailing Summary is authoritative; earlier hits may be quotes.
+            ("verdict_last_wins_pass.md",
+             "### Overall Verdict: FAIL\n(quoted earlier)\n### Overall Verdict: PASS\n", "PASS"),
+            ("verdict_last_wins_fail.md",
+             "### Overall Verdict: PASS\n(quoted earlier)\n### Overall Verdict: FAIL\n", "FAIL"),
+            ("verdict_placeholder.md", "### Overall Verdict: [PASS/FAIL]\n", "UNPARSEABLE"),
+            ("verdict_none.md", "# Report\n\nNo verdict field here.\n", "UNPARSEABLE"),
+            ("verdict_blank.md", "  \n\n", "MISSING"),
+        ]
+        for fname, body, expected in parse_cases:
+            got = parse_report_verdict(_mk(fname, body))
+            check(f"parse_report_verdict({fname}) -> {expected}",
+                  got == expected, f"got {got}")
+
+        check("parse_report_verdict(absent file) -> MISSING",
+              parse_report_verdict(os.path.join(td, "does_not_exist.md")) == "MISSING",
+              "an absent report must never count as passing")
+        check("parse_report_verdict('') -> MISSING",
+              parse_report_verdict("") == "MISSING")
+
+        pass_report = _mk("ok.md", "### Overall Verdict: PASS\n")
+        fail_report = _mk("bad.md", "### Overall Verdict: FAIL\n")
+        check("compute_verdict(STRUCTURAL, PASS) -> DONE",
+              compute_verdict("STRUCTURAL", pass_report) == "DONE")
+        check("compute_verdict(STRUCTURAL, FAIL) -> CONTINUE",
+              compute_verdict("STRUCTURAL", fail_report) == "CONTINUE")
+        check("compute_verdict(STRUCTURAL, absent) -> CONTINUE",
+              compute_verdict("STRUCTURAL", os.path.join(td, "nope.md")) == "CONTINUE")
+        check("compute_verdict(FINAL, PASS, FAIL) -> CONTINUE",
+              compute_verdict("FINAL", pass_report, fail_report) == "CONTINUE")
+        check("compute_verdict(FINAL, PASS, PASS) -> DONE",
+              compute_verdict("FINAL", pass_report, pass_report) == "DONE")
+        check("compute_verdict(FINAL, PASS, '') -> CONTINUE",
+              compute_verdict("FINAL", pass_report, "") == "CONTINUE",
+              "FINAL must require the detailed report")
 
     # -------------------------------------------------------
     # Test 4: Skill loading
@@ -408,7 +451,7 @@ async def run_smoke_test(config: dict, config_path: str | None = None) -> bool:
     # Validate decomposition model assignments
     decomp_models = decomp_cfg.get("models", {})
     required_agents = ["decomposer", "single_prover", "regulator",
-                      "structural_verifier", "detailed_verifier", "verdict"]
+                      "structural_verifier", "detailed_verifier"]
     for agent in required_agents:
         _validate_role(f"decomposition.models.{agent}", decomp_models.get(agent))
 
