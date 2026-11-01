@@ -265,7 +265,7 @@ Use `<key-original-step>` tags to mark nontrivial original work, write heuristic
 
 ## Output Format
 
-Write your complete proof to:
+Write your proof to:
 ```
 {output_file}
 ```
