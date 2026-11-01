@@ -151,6 +151,36 @@ If this file exists, it explains why the previous proof failed. **Read this care
 - Problem statement alterations
 - Undeclared deviations from decomposition plan
 
+### Previous Partial Proof (read only if the path below is non-empty)
+```
+{previous_partial_file}
+```
+
+If that path is empty, none of this section applies to you.
+
+If it is non-empty, the previous session was **interrupted, not judged**. It
+ended before the proof was finished, so no verifier ever read what it wrote and
+there is no report above to answer. Nothing was found wrong with the argument —
+the session ran out.
+
+That session's finished steps have been carried over into `{proof_steps_dir}`
+unchanged:
+
+- **Already written:** {carried_steps}
+- **Still to write:** {remaining_steps}
+
+Continue from the first unwritten step. Read the carried files you depend on,
+and do not restate or rewrite them — the assembled proof takes each step from
+its own file, so rewriting one can only contradict a step you already stand
+behind. The exception: a carried step marked `**Status:** not proved` is the
+wall to attack first, and replacing that file with a real proof is exactly what
+is wanted.
+
+The path above is those steps joined into one document. It is convenient for
+orientation and expensive to read whole, since the text is already on disk file
+by file, so open it only if the individual files leave you unsure how the
+argument is meant to fit together.
+
 ---
 
 ## Use Computational Tools Freely
@@ -293,7 +323,8 @@ Use the ids from `proof_order` **verbatim** as filenames: `STEP1.md`, `STEP7a.md
 be assembled into `{output_file}`.
 
 **Write each step file once.** A finished step is never rewritten; corrections go
-into the step you are still working on.
+into the step you are still working on. Steps carried over from an interrupted
+session already count as written.
 
 **If a step cannot be proved, still write its file**, and say so inside it:
 
@@ -412,6 +443,7 @@ Before finishing, verify:
 - [ ] Key steps (`is_key_step: true`) wrapped in `<key-original-step>` tags, heuristics are there.
 - [ ] Every step is either proved or carries `**Status:** not proved` with **Tried** and **Breaks at** — nothing is silently weakened, replaced by a special case, or disguised
 - [ ] No step file was rewritten after it was finished
+- [ ] If this session continued an interrupted proof, every carried step is either left as it was or deliberately replaced with a better argument
 - [ ] `99_notes.md` written, including an accurate Deviations section
 - [ ] All external results properly cited with `<cite>` tags
 - [ ] No hand-waving ("clearly", "obviously") without justification

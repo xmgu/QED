@@ -21,10 +21,12 @@ from decomposition_prover import (
     parse_report_verdict,
     compute_verdict,
     assemble_proof_from_steps,
+    carry_forward_checkpoints,
+    interrupted_partial,
     step_order,
     steps_dir,
 )
-from compat import decode_kwargs, resolve_cli, write_text
+from compat import decode_kwargs, read_text, resolve_cli, write_text
 
 
 async def run_smoke_test(config: dict, config_path: str | None = None) -> bool:
@@ -169,6 +171,9 @@ async def run_smoke_test(config: dict, config_path: str | None = None) -> bool:
             human_help_file="/tmp/test_human_help.md",
             previous_proof_file="",
             previous_verification_file="",
+            previous_partial_file="",
+            carried_steps="none",
+            remaining_steps="none",
             output_file="/tmp/test_proof.md",
             output_dir="/tmp/test_output",
             scratchpad_file="/tmp/test_output/scratchpad.md",
@@ -176,6 +181,10 @@ async def run_smoke_test(config: dict, config_path: str | None = None) -> bool:
         )
         check("single_prover.md renders OK", "test_problem.tex" in prompt)
         check("single_prover.md has decomposition file", "test_decomposition.yaml" in prompt)
+        check("single_prover.md has continuation section",
+              "interrupted, not judged" in prompt
+              and "{previous_partial_file}" not in prompt,
+              "the section must render, not leak the placeholder name")
     except Exception as e:
         check("single_prover.md renders OK", False, str(e))
 
@@ -369,6 +378,93 @@ async def run_smoke_test(config: dict, config_path: str | None = None) -> bool:
         check("missing front matter is regenerated from the problem file",
               text.startswith("# Proof") and "integral of f vanishes" in text,
               "the verifier compares this section against the problem file")
+
+    # -------------------------------------------------------
+    # Test 3e: Carrying an interrupted attempt forward
+    # -------------------------------------------------------
+    print("\n=== Test 3e: Continuation of an interrupted proof ===")
+    with tempfile.TemporaryDirectory() as td:
+        decomposition = {"proof_order": ["STEP1", "STEP2", "GOAL"]}
+        body = "**Claim:** claim.\n\n**Proof:**\n" + ("argument. " * 40)
+
+        def _seed_attempt(directory: str, steps: dict[str, str],
+                          proof_md: bool, notes: str = "") -> None:
+            checkpoints = steps_dir(directory)
+            os.makedirs(checkpoints)
+            for sid, text in steps.items():
+                write_text(os.path.join(checkpoints, sid + ".md"),
+                           f"### {sid}: Checkpoint\n\n{text}\n")
+            write_text(os.path.join(checkpoints, "00_front.md"), "# Proof\n\n## Proof\n")
+            write_text(os.path.join(checkpoints, "99_notes.md"), notes)
+            write_text(os.path.join(directory, "scratchpad.md"), "tried X on GOAL\n")
+            if proof_md:
+                write_text(os.path.join(directory, "proof.md"), "### STEP1:\nproof\n")
+
+        # An attempt that wrote proof.md failed on its mathematics. Its steps
+        # were judged, so they must not be inherited.
+        judged = os.path.join(td, "proof_1")
+        _seed_attempt(judged, {"STEP1": body}, proof_md=True)
+        check("a judged attempt is not a continuation", interrupted_partial(judged) == "")
+        new_dir = os.path.join(td, "proof_2")
+        carried, missing = carry_forward_checkpoints(new_dir, judged, decomposition)
+        check("judged steps are not carried forward", carried == [] and missing ==
+              ["STEP1", "STEP2", "GOAL"], f"carried={carried} missing={missing}")
+
+        # An attempt with no proof.md and no partial wrote nothing at all.
+        empty = os.path.join(td, "proof_empty")
+        os.makedirs(empty)
+        check("an attempt that wrote nothing is not a continuation",
+              interrupted_partial(empty) == "")
+
+        # An interrupted attempt left a partial: continue from it.
+        cut = os.path.join(td, "proof_cut")
+        _seed_attempt(
+            cut, {"STEP1": body, "STEP2": "### STEP2: todo\n"}, proof_md=False,
+            notes="## Unresolved Steps\n\n- **GOAL** — not proved\n\n## Key Ideas\n\nDirect.\n",
+        )
+        write_text(os.path.join(cut, "proof_partial.md"), "# Proof\n\n### STEP1:\n...\n")
+        check("an interrupted attempt is a continuation",
+              interrupted_partial(cut) == os.path.join(cut, "proof_partial.md"))
+
+        resumed = os.path.join(td, "proof_next")
+        carried, missing = carry_forward_checkpoints(resumed, cut, decomposition)
+        check("finished steps carried forward", carried == ["STEP1"], f"got {carried}")
+        check("unfinished steps remain to write",
+              missing == ["STEP2", "GOAL"], f"got {missing}")
+        check("carried step file exists in the new attempt",
+              os.path.exists(os.path.join(steps_dir(resumed), "STEP1.md")))
+        check("stub is not carried as progress",
+              not os.path.exists(os.path.join(steps_dir(resumed), "STEP2.md")))
+        check("front matter carried forward",
+              os.path.exists(os.path.join(steps_dir(resumed), "00_front.md")))
+        check("scratchpad carried forward",
+              "tried X on GOAL" in read_text(os.path.join(resumed, "scratchpad.md")),
+              "it records the routes already tried on the missing steps")
+        notes = read_text(os.path.join(steps_dir(resumed), "99_notes.md"))
+        check("carried notes drop the dead session's gap list",
+              "## Unresolved Steps" not in notes and "## Key Ideas" in notes,
+              "it describes steps this attempt may still prove")
+
+        # The new attempt now stands on its own: if it is cut off too, it still
+        # assembles from its own directory.
+        problem = os.path.join(td, "problem.tex")
+        write_text(problem, "Prove that the integral of f vanishes.\n")
+        text, present, still_missing = assemble_proof_from_steps(
+            resumed, problem, decomposition)
+        check("a continuation assembles from its own directory",
+              present == ["STEP1"] and still_missing == ["STEP2", "GOAL"],
+              f"present={present} missing={still_missing}")
+
+        # Resuming twice must not clobber what the current session already wrote.
+        write_text(os.path.join(steps_dir(resumed), "STEP2.md"),
+                   "### STEP2: Checkpoint\n\n" + body)
+        carried, missing = carry_forward_checkpoints(resumed, cut, decomposition)
+        check("a resumed session's own file is never overwritten",
+              carried == ["STEP1", "STEP2"] and missing == ["GOAL"],
+              f"carried={carried} missing={missing}")
+        check("the carried file keeps the current session's text",
+              "### STEP2: Checkpoint" in
+              read_text(os.path.join(steps_dir(resumed), "STEP2.md")))
 
     # -------------------------------------------------------
     # Test 4: Skill loading

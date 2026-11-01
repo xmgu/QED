@@ -118,10 +118,12 @@ case the model never got a chance to.
 | `decomposition_prover.py` | `ProofIncomplete(ProofNotProduced)` carrying `present` / `missing` / `partial_file` |
 | | `looks_like_step()`, `steps_dir()`, `_natural_step_key()`, `step_order()` |
 | | `collect_step_files()`, `_front_matter()`, `_unresolved_section()`, `assemble_proof_from_steps()` |
-| | `run_single_prover()`: on a missing `proof.md`, try the checkpoint before the chat-response fallback |
+| | `interrupted_partial()`, `carry_forward_checkpoints()` (P1) |
+| | `run_single_prover()`: on a missing `proof.md`, try the checkpoint before the chat-response fallback; on `proof > 1`, carry an interrupted attempt's checkpoints forward |
 | | proof loop: catch `ProofIncomplete`, synthesise the feedback, point `proof_file` at the partial |
 | `single_prover.md` | `## Output Format` rewritten as a per-file protocol; `{proof_steps_dir}` placeholder; checklist item |
-| `smoke_test.py` | render kwargs, Test 3d (assembler) |
+| | `### Previous Partial Proof` section; `{previous_partial_file}`, `{carried_steps}`, `{remaining_steps}` |
+| `smoke_test.py` | render kwargs, Test 3d (assembler), Test 3e (continuation) |
 
 ## Costs
 
@@ -130,21 +132,76 @@ case the model never got a chance to.
 | output tokens, completed run | ~21 k | ~21 k (same document, written in nine pieces) |
 | tool round-trips | 1 write | 9 writes |
 | output after truncation | 0 | up to 8/9 of the proof |
-| next attempt after truncation | restarts | can reuse the checkpoint (P1) |
+| next attempt after truncation | restarts all nine steps | continues from the first missing step |
 
 Worst case, if the model ignores the protocol and also writes `proof.md` at the
 end, output doubles. The prompt forbids rewriting finished steps and the
 assembler prefers an existing `proof.md`, so the failure mode is a cost
 regression, not a correctness one.
 
-## Not done (P1)
+## P1: continuing from the interrupted attempt
 
-Reusing the partial on the next attempt — passing `{previous_partial_file}` so
-the prover continues from the first missing step instead of restarting — is a
-separate change. This commit only makes the interruption *visible and bounded*.
+Checkpointing bounded the loss; on its own it did not recover it. Each attempt
+writes into its own `proof_N/` directory, so `proof_2` began with an empty
+`proof_steps/` and rewrote the eight steps `proof_1` had already finished. The
+93 minutes bought nothing.
 
-Also out of scope: whether an interrupted attempt should consume one of
-`max_proof_attempts`. It does, by design, unchanged.
+Two changes make the interruption *resumable*, and both are required:
+
+| | Without it |
+|---|---|
+| copy the finished checkpoints into the new attempt | the assembly reads an empty directory, so the carried text counts for nothing |
+| tell the prompt which ids it inherited | the model rewrites all nine steps, because nothing indicates it may skip some |
+
+`carry_forward_checkpoints()` copies `00_front.md`, every checkpoint that passes
+`looks_like_step()`, `99_notes.md` and `scratchpad.md`. Nothing in the
+destination is overwritten, so a session that has already written some of these
+files itself keeps them, and the function returns the ids it carried plus the
+ones still to write — which is exactly what the prompt's new section renders as
+*Already written* / *Still to write*.
+
+### Only an interrupted attempt can be continued
+
+The gate is `interrupted_partial()`: a previous attempt counts as interrupted
+only when it left `proof_partial.md` **and** no `proof.md`. The distinction
+matters, because the two failure modes call for opposite handling:
+
+| Previous attempt | Signal | Carry forward? |
+|---|---|---|
+| interrupted | `proof_partial.md`, no `proof.md` | yes — the steps were never judged |
+| failed on its mathematics | `proof.md` present | **no** — a verifier already rejected those steps |
+
+Carrying a judged attempt forward would freeze its rejected argument into every
+later attempt: no step file would change, so verification would return the same
+verdict until `max_proof_attempts` ran out. The attempt therefore inherits at
+most one hop, because the attempt that follows a completed one starts fresh
+whatever happened before it.
+
+The copied `99_notes.md` has its `## Unresolved Steps` section stripped: that list
+describes the session that died, and would otherwise survive into a later proof
+that does prove those steps. `Key Ideas` and `Deviations` are kept, since they
+describe the plan and are still true.
+
+### What the prompt is told
+
+`interrupted, not judged` is stated outright, because the model's default reading
+of `proof > 1` is "a verifier found something wrong, go read the report" — and in
+this case there is no report. The section then lists the carried and remaining
+ids and forbids restating a carried step, with one exception: a carried step
+marked `**Status:** not proved` is the wall to attack first, since it is the only
+part of the previous session that is a claim about the mathematics rather than a
+truncation.
+
+## Not done
+
+Whether an interrupted attempt should consume one of `max_proof_attempts` is
+unresolved. It does, by design, unchanged: a continuation is a new attempt, and
+`max_proof_attempts: 8` is already generous enough that the checkpoints (rather
+than the counter) are the binding constraint.
+
+Also unaddressed: `model_runner` has no timeout, so a session that hangs — the
+5,610 s call with no `turn.completed` event — cannot be interrupted at all. That
+is the next change, ahead of any further work on the checkpoint protocol.
 
 ## Verification
 
@@ -157,3 +214,10 @@ Also out of scope: whether an interrupted attempt should consume one of
    skipped.
 4. Existing regressions: 13 real verification reports parse identically; resume
    detection on all five runs unchanged.
+5. Test 3e, both directions of the gate: a judged attempt carries nothing and
+   leaves the destination empty; an interrupted one carries step files, front
+   matter and scratchpad, strips the stale gap list, and the new attempt then
+   assembles from its own directory. Running it twice does not overwrite what
+   the live session wrote.
+6. Offline `smoke_test.py` (`shutil.which` stubbed): 97 passed, 1 failed — the
+   failure being the deliberately stubbed Codex connectivity check.

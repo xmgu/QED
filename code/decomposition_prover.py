@@ -20,6 +20,7 @@ import asyncio
 import json
 import os
 import re
+import shutil
 import yaml
 from datetime import datetime
 from pathlib import Path
@@ -396,6 +397,117 @@ def assemble_proof_from_steps(proof_dir: str, problem_file: str,
             parts.append(notes)
 
     return "\n\n".join(parts).rstrip() + "\n", present, missing
+
+
+# ---------------------------------------------------------------------------
+# Carrying an interrupted attempt forward
+# ---------------------------------------------------------------------------
+#
+# An interrupted attempt leaves its finished steps on disk, but the next
+# attempt starts in a new ``proof_N/`` directory, so without help it rewrites
+# all of them. Two things fix that, and both are needed: the checkpoints are
+# copied into the new attempt's directory, and the prompt is told which steps
+# are already written. Copying alone would leave the model unaware it has
+# anything to continue from; telling it alone would leave the assembly reading
+# an empty directory.
+
+def _copy_bytes(source: str, target: str) -> bool:
+    """Copy a file verbatim, skipping an empty source and an existing target.
+
+    Returns whether anything was copied. Byte-level copying is deliberate: see
+    ``carry_forward_checkpoints`` for why the text path would corrupt the file.
+    """
+    try:
+        if os.path.exists(target) or os.path.getsize(source) == 0:
+            return False
+        shutil.copyfile(source, target)
+        return True
+    except OSError:                     # absent or unreadable: nothing to carry
+        return False
+
+
+def interrupted_partial(previous_proof_dir: str) -> str:
+    """Path to an interrupted attempt's partial document, or ``""``.
+
+    ``proof_partial.md`` is written in exactly one situation: step checkpoints
+    survived a session that ended before it wrote ``proof.md``. An attempt that
+    *did* write ``proof.md`` failed on its mathematics instead, and its steps
+    must not be inherited -- a verifier has already judged them, and carrying
+    them over would freeze the same rejected argument into every later attempt.
+    """
+    if not previous_proof_dir:
+        return ""
+    if os.path.exists(os.path.join(previous_proof_dir, "proof.md")):
+        return ""
+    partial = os.path.join(previous_proof_dir, "proof_partial.md")
+    return partial if os.path.exists(partial) else ""
+
+
+def carry_forward_checkpoints(proof_dir: str, previous_proof_dir: str,
+                              decomposition: dict | None):
+    """Copy an interrupted attempt's checkpoints into the new attempt.
+
+    Returns ``(carried, missing)``: the ids the new attempt inherits, and those
+    it still has to write. Copying rather than pointing the assembler at the old
+    directory keeps each attempt self-contained -- if this one is interrupted
+    too, it still assembles from what exists inside its own directory.
+
+    Nothing in the destination is overwritten: a resumed session may already
+    have written some of these files itself.
+
+    Checkpoints are copied byte for byte rather than through ``read_text`` /
+    ``write_text``. The text round trip is not transparent: ``write_text`` opens
+    the file in text mode, so a model-written ``\\r\\n`` is read back as ``\\r\\n``
+    and translated again on the way out, doubling the carriage returns once per
+    newline. It would also transcode a checkpoint the decoder had to fall back
+    on, and re-serialise a file whose content is already exactly right.
+    """
+    order = step_order(decomposition, previous_proof_dir)
+    if not interrupted_partial(previous_proof_dir):
+        # Judged, or empty. Either way there is no continuation to carry, and
+        # callers must not be able to get one by forgetting to ask.
+        return [], order
+
+    src = steps_dir(previous_proof_dir)
+    dst = steps_dir(proof_dir)
+    if not os.path.isdir(src):
+        return [], order
+
+    os.makedirs(dst, exist_ok=True)
+
+    _copy_bytes(os.path.join(src, "00_front.md"), os.path.join(dst, "00_front.md"))
+
+    carried: list[str] = []
+    for step_id in order:
+        target = os.path.join(dst, step_id + ".md")
+        if os.path.exists(target):
+            carried.append(step_id)     # already written by the session in progress
+            continue
+        if looks_like_step(read_file(os.path.join(src, step_id + ".md"))):
+            # Only claim the step once its file is actually there: a step
+            # reported as written but absent would never be written again, and
+            # the assembly would then call this attempt incomplete.
+            if _copy_bytes(os.path.join(src, step_id + ".md"), target):
+                carried.append(step_id)
+
+    # Notes summarise the session that died, so the model's own Unresolved list
+    # describes steps this attempt may now prove. Drop just that section and
+    # keep Key Ideas / Deviations, which are still true of the plan. This one
+    # has to be rewritten, so normalise its line endings before writing it.
+    notes = os.path.join(dst, "99_notes.md")
+    if not os.path.exists(notes):
+        text = _UNRESOLVED_SECTION_RE.sub("", read_file(os.path.join(src, "99_notes.md")))
+        text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+        if text:
+            write_file(notes, text)
+
+    # The scratchpad is the most useful thing to inherit: it records the routes
+    # already tried on the steps that are still missing. It lives beside the
+    # checkpoint directory, not inside it.
+    _copy_bytes(os.path.join(previous_proof_dir, "scratchpad.md"),
+                os.path.join(proof_dir, "scratchpad.md"))
+
+    return carried, [s for s in order if s not in carried]
 
 
 # ---------------------------------------------------------------------------
@@ -1184,6 +1296,9 @@ async def run_single_prover(
     # For new revision or new attempt, these are empty
     previous_proof_file = ""
     previous_verification_file = ""
+    previous_partial_file = ""
+    carried_steps: list[str] = []
+    remaining_steps: list[str] = []
     if state.proof > 1:
         prev_proof_dir = os.path.join(state.get_revision_dir(), f"proof_{state.proof - 1}")
         previous_proof_file = os.path.join(prev_proof_dir, "proof.md")
@@ -1194,6 +1309,21 @@ async def run_single_prover(
             previous_verification_file = detailed_path
         elif os.path.exists(structural_path):
             previous_verification_file = structural_path
+
+        # If the previous attempt was cut off rather than judged, continue it:
+        # the finished steps move into this attempt and the prompt says which
+        # ones are left.
+        previous_partial_file = interrupted_partial(prev_proof_dir)
+        if previous_partial_file:
+            carried_steps, remaining_steps = carry_forward_checkpoints(
+                proof_dir, prev_proof_dir, state.decomposition)
+            if decomp_logger:
+                decomp_logger.log(
+                    f"Continuing an interrupted attempt: carried "
+                    f"{len(carried_steps)} step(s) forward "
+                    f"({', '.join(carried_steps) or 'none'}); "
+                    f"still to write {', '.join(remaining_steps) or 'none'}"
+                )
 
     scratchpad_file = os.path.join(proof_dir, "scratchpad.md")
     proof_steps_dir = steps_dir(proof_dir)
@@ -1207,6 +1337,12 @@ async def run_single_prover(
         human_help_file=human_help_file,
         previous_proof_file=previous_proof_file,
         previous_verification_file=previous_verification_file,
+        previous_partial_file=previous_partial_file,
+        carried_steps=", ".join(carried_steps) or "none",
+        # Not a continuation, so "none to write" would read as "nothing to do":
+        # every id in proof_order is the model's to write.
+        remaining_steps=", ".join(remaining_steps)
+                        or ("none" if previous_partial_file else "all of proof_order"),
         output_file=output_file,
         output_dir=state.output_dir,
         scratchpad_file=scratchpad_file,
