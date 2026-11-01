@@ -309,7 +309,9 @@ TSWLatexianTemp*
 __pycache__/
 .venv/
 /test/
-docs/
+# docs/ is ignored by default (template rule), but review records are tracked.
+docs/*
+!docs/verdict_proof_review.md
 *.pyc
 
 # Streamlit UI runtime data
