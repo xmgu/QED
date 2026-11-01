@@ -210,7 +210,7 @@ steps:
       [Explanation of the novel insight required]
     strategy_hint: |
       [Optional: approach suggestion for this challenging step]
-    hueristics: |
+    heuristics: |
       [Why this key_step could possibly work]
 
   # Add more steps as needed (typically 2-10 steps)
