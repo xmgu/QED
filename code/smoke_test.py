@@ -20,6 +20,9 @@ from decomposition_prover import (
     load_prompt as decomp_load_prompt,
     parse_report_verdict,
     compute_verdict,
+    assemble_proof_from_steps,
+    step_order,
+    steps_dir,
 )
 from compat import decode_kwargs, resolve_cli, write_text
 
@@ -169,6 +172,7 @@ async def run_smoke_test(config: dict, config_path: str | None = None) -> bool:
             output_file="/tmp/test_proof.md",
             output_dir="/tmp/test_output",
             scratchpad_file="/tmp/test_output/scratchpad.md",
+            proof_steps_dir="/tmp/test_output/proof_steps",
         )
         check("single_prover.md renders OK", "test_problem.tex" in prompt)
         check("single_prover.md has decomposition file", "test_decomposition.yaml" in prompt)
@@ -278,6 +282,93 @@ async def run_smoke_test(config: dict, config_path: str | None = None) -> bool:
         check("compute_verdict(FINAL, PASS, '') -> CONTINUE",
               compute_verdict("FINAL", pass_report, "") == "CONTINUE",
               "FINAL must require the detailed report")
+
+    # -------------------------------------------------------
+    # Test 3d: Per-step proof checkpoints
+    # -------------------------------------------------------
+    print("\n=== Test 3d: Per-step proof checkpoints ===")
+    with tempfile.TemporaryDirectory() as td:
+        problem_file = os.path.join(td, "problem.tex")
+        write_text(problem_file, "Prove that the integral of f vanishes.\n")
+
+        proof_dir = os.path.join(td, "proof_1")
+        checkpoint_dir = steps_dir(proof_dir)
+        os.makedirs(checkpoint_dir)
+        decomposition = {"proof_order": ["STEP1", "STEP2", "GOAL"]}
+        body = "**Claim:** claim.\n\n**Proof:**\n" + ("argument. " * 40)
+
+        def _write_step(step_id: str, text: str, heading: bool = True) -> None:
+            head = f"### {step_id}: Checkpoint\n\n" if heading else ""
+            write_text(os.path.join(checkpoint_dir, step_id + ".md"),
+                       head + text + "\n\n**Dependencies:** none\n")
+
+        check("assembler returns None when no checkpoint exists",
+              assemble_proof_from_steps(proof_dir, problem_file, decomposition) is None,
+              "an absent checkpoint must fall through to the old behaviour")
+
+        for sid in ("STEP1", "STEP2", "GOAL"):
+            _write_step(sid, body)
+        write_text(os.path.join(checkpoint_dir, "00_front.md"),
+                   "# Proof\n\n## Problem Statement\n\nProve it.\n\n## Proof\n")
+        write_text(os.path.join(checkpoint_dir, "99_notes.md"),
+                   "## Key Ideas\n\nDirect.\n")
+
+        text, present, missing = assemble_proof_from_steps(
+            proof_dir, problem_file, decomposition)
+        check("complete checkpoint: nothing missing", missing == [], f"missing={missing}")
+        check("complete checkpoint: kept in proof_order",
+              text.index("### STEP1:") < text.index("### STEP2:")
+              < text.index("### GOAL:"))
+        check("complete checkpoint: front matter preserved", text.startswith("# Proof"))
+        check("complete checkpoint: notes appended", "## Key Ideas" in text)
+        check("complete checkpoint: no generated gap list",
+              "## Unresolved Steps" not in text,
+              "the model owns that section when the checkpoint is complete")
+
+        # The session died before STEP2 and GOAL were written.
+        for sid in ("STEP2", "GOAL"):
+            os.remove(os.path.join(checkpoint_dir, sid + ".md"))
+        write_text(os.path.join(checkpoint_dir, "99_notes.md"),
+                   "## Unresolved Steps\n\nNone — all steps proved.\n\n"
+                   "## Key Ideas\n\nDirect.\n")
+        text, present, missing = assemble_proof_from_steps(
+            proof_dir, problem_file, decomposition)
+        check("partial checkpoint: missing listed in proof_order",
+              missing == ["STEP2", "GOAL"], f"got {missing}")
+        check("partial checkpoint: gap list generated",
+              "## Unresolved Steps" in text and "**STEP2**" in text)
+        check("partial checkpoint: stale model gap list dropped",
+              text.count("## Unresolved Steps") == 1,
+              "two contradictory lists would be worse than none")
+        check("partial checkpoint: notes kept after the gap list",
+              text.index("## Unresolved Steps") < text.index("## Key Ideas"))
+
+        # A stub is not progress.
+        write_text(os.path.join(checkpoint_dir, "STEP2.md"), "### STEP2: todo\n")
+        _, _, missing = assemble_proof_from_steps(proof_dir, problem_file, decomposition)
+        check("stub checkpoint counts as missing", "STEP2" in missing)
+
+        # A checkpoint without a heading is invisible to the verifier's step scan.
+        _write_step("STEP2", body, heading=False)
+        text, _, missing = assemble_proof_from_steps(
+            proof_dir, problem_file, decomposition)
+        check("headingless checkpoint regains its heading",
+              "### STEP2:" in text and "STEP2" not in missing)
+
+        # No usable decomposition: natural order, one digit group per number,
+        # so STEP10 follows STEP2 rather than preceding it.
+        _write_step("GOAL", body)
+        write_text(os.path.join(checkpoint_dir, "STEP10.md"), body)
+        check("step_order fallback: STEP2 before STEP10, GOAL last",
+              step_order(None, proof_dir) == ["STEP1", "STEP2", "STEP10", "GOAL"],
+              f"got {step_order(None, proof_dir)}")
+
+        # Front matter is regenerated when the model never wrote it.
+        os.remove(os.path.join(checkpoint_dir, "00_front.md"))
+        text, _, _ = assemble_proof_from_steps(proof_dir, problem_file, None)
+        check("missing front matter is regenerated from the problem file",
+              text.startswith("# Proof") and "integral of f vanishes" in text,
+              "the verifier compares this section against the problem file")
 
     # -------------------------------------------------------
     # Test 4: Skill loading

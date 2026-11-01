@@ -208,6 +208,196 @@ def looks_like_proof(text: str) -> bool:
     return bool(_PROOF_TITLE_RE.search(text)) and len(text) >= _MIN_PROOF_CHARS
 
 
+class ProofIncomplete(ProofNotProduced):
+    """The prover wrote part of the proof, then the session ended.
+
+    The step checkpoints under ``proof_steps/`` cover *some* of ``proof_order``.
+    Unlike a mathematical failure, there is nothing here for a verifier to judge:
+    the remaining steps were never attempted. The written part is preserved as
+    ``proof_partial.md`` so the loss is bounded and the cause is legible.
+    """
+
+    def __init__(self, message: str, present: list[str], missing: list[str],
+                 partial_file: str) -> None:
+        super().__init__(message)
+        self.present = present
+        self.missing = missing
+        self.partial_file = partial_file
+
+
+# ---------------------------------------------------------------------------
+# Per-step proof checkpoints
+# ---------------------------------------------------------------------------
+#
+# The prover is asked to write each step to its own file the moment the step is
+# finished, so a session that dies mid-proof still leaves everything it managed
+# to do. Rebuilding proof.md from those files happens here rather than in the
+# prompt: it is deterministic, and asking the model to concatenate its own
+# output would re-emit the whole proof (~21k tokens for an 85 KB document).
+
+_STEPS_DIRNAME = "proof_steps"
+
+# A checkpoint below this size is a stub, not a proof of the step. Real ones run
+# to thousands of characters; the threshold only separates "wrote something"
+# from "wrote a placeholder", so a stub counts as missing, not as progress.
+_MIN_STEP_CHARS = 200
+
+# Step ids come from the decomposition and become file names, so they must not
+# be able to escape the directory.
+_STEP_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_-]{0,31}$")
+
+_PROOF_H1_RE = re.compile(r"^#\s+Proof\b", re.MULTILINE | re.IGNORECASE)
+_PROOF_H2_RE = re.compile(r"^##\s+Proof\b", re.MULTILINE | re.IGNORECASE)
+
+# One whole "## Unresolved Steps" section, up to the next level-2 heading. Used
+# to drop the model's copy when the pipeline generates its own.
+_UNRESOLVED_SECTION_RE = re.compile(
+    r"^##\s+Unresolved Steps\b.*?(?=^##\s|\Z)",
+    re.MULTILINE | re.IGNORECASE | re.DOTALL,
+)
+
+
+def looks_like_step(text: str) -> bool:
+    """Whether a checkpoint file holds a step's argument rather than a stub."""
+    return bool(text) and len(text.strip()) >= _MIN_STEP_CHARS
+
+
+def steps_dir(proof_dir: str) -> str:
+    """Directory holding this attempt's per-step checkpoints."""
+    return os.path.join(proof_dir, _STEPS_DIRNAME)
+
+
+def _natural_step_key(step_id: str):
+    """Sort STEP2 before STEP10, with GOAL last for the no-plan fallback."""
+    parts = re.split(r"(\d+)", step_id.upper())
+    return (
+        1 if step_id.upper() == "GOAL" else 0,
+        [int(p) if p.isdigit() else p for p in parts],
+    )
+
+
+def step_order(decomposition: dict | None, proof_dir: str) -> list[str]:
+    """The ids a complete proof must cover, in the order they must appear.
+
+    ``proof_order`` from the decomposition is authoritative. File-name order is
+    wrong in two ways: GOAL sorts before STEP alphabetically, and STEP10 before
+    STEP2. Real plans also use suffixed ids (STEP7a, STEP7b), which is a further
+    reason to copy ids verbatim instead of parsing them.
+    """
+    order: list[str] = []
+    if isinstance(decomposition, dict):
+        order = [str(s).strip() for s in (decomposition.get("proof_order") or [])]
+    order = [s for s in order if _STEP_ID_RE.match(s)]
+    if order:
+        return order
+
+    # No usable plan (corrupt YAML, hand-built directory): trust the checkpoints
+    # that exist, in natural order.
+    directory = steps_dir(proof_dir)
+    try:
+        names = [os.path.splitext(f)[0] for f in os.listdir(directory)
+                 if f.endswith(".md")]
+    except OSError:
+        return []
+    return sorted((n for n in names if _STEP_ID_RE.match(n)), key=_natural_step_key)
+
+
+def collect_step_files(proof_dir: str, decomposition: dict | None):
+    """Read the step checkpoints.
+
+    Returns ``(present, missing, contents)``: the ids in ``proof_order`` that
+    hold a real argument, those that do not (absent *or* a stub), and a map from
+    id to text for the former.
+    """
+    directory = steps_dir(proof_dir)
+    present: list[str] = []
+    missing: list[str] = []
+    contents: dict[str, str] = {}
+    for step_id in step_order(decomposition, proof_dir):
+        text = read_file(os.path.join(directory, step_id + ".md"))
+        if looks_like_step(text):
+            present.append(step_id)
+            contents[step_id] = text
+        else:
+            missing.append(step_id)
+    return present, missing, contents
+
+
+def _front_matter(proof_dir: str, problem_file: str) -> str:
+    """Title, problem statement, and the ``## Proof`` heading steps sit under."""
+    front = read_file(os.path.join(steps_dir(proof_dir), "00_front.md")).strip()
+    if not front:
+        # Cheaper and more reliable than trusting a partly-written checkpoint:
+        # the problem statement is copied from the file the verifier compares
+        # against, so Phase 1 cannot fail on a paraphrase.
+        problem = read_file(problem_file).strip()
+        front = ("# Proof\n\n## Problem Statement\n\n"
+                 + (problem or "[problem file unavailable]"))
+    if not _PROOF_H1_RE.search(front):
+        front = "# Proof\n\n" + front
+    if not _PROOF_H2_RE.search(front):
+        front += "\n\n## Proof"
+    return front
+
+
+def _unresolved_section(missing: list[str]) -> str:
+    """The gap list, generated from the file listing rather than from a model."""
+    lines = [
+        "## Unresolved Steps",
+        "",
+        "The proof session ended before these steps were written. They are "
+        "listed here so the gap is explicit rather than hidden:",
+        "",
+    ]
+    for step_id in missing:
+        lines += [
+            f"- **{step_id}** — not proved",
+            "  - **Tried:** the session ended before this step was written",
+            "  - **Breaks at:** no argument for this step exists",
+        ]
+    return "\n".join(lines)
+
+
+def assemble_proof_from_steps(proof_dir: str, problem_file: str,
+                              decomposition: dict | None):
+    """Rebuild the proof from its per-step checkpoints.
+
+    Returns ``(text, present, missing)``, or ``None`` when no checkpoint holds a
+    real argument. ``missing`` is what separates "the session died here" from
+    "the mathematics is incomplete": the prompt requires a file for every id, so
+    an unprovable step is a file that says so, not an absent file.
+    """
+    present, missing, contents = collect_step_files(proof_dir, decomposition)
+    if not present:
+        return None
+
+    chunks = []
+    for step_id in present:
+        chunk = contents[step_id].strip()
+        if not re.match(r"^#{1,6}\s*\S", chunk):
+            # A checkpoint without any heading cannot be located by the
+            # verifier's step scan; restore the heading the prompt mandates.
+            chunk = f"### {step_id}:\n\n" + chunk
+        chunks.append(chunk)
+
+    parts = [_front_matter(proof_dir, problem_file), "\n\n---\n\n".join(chunks)]
+    if missing:
+        parts.append(_unresolved_section(missing))
+
+    notes = read_file(os.path.join(steps_dir(proof_dir), "99_notes.md")).strip()
+    if notes:
+        # The model owns this section when the checkpoint is complete. When it
+        # is not, the generated gap list above is authoritative, so drop the
+        # model's copy -- but only that section, not the Key Ideas and
+        # Deviations that follow it.
+        if missing:
+            notes = _UNRESOLVED_SECTION_RE.sub("", notes).strip()
+        if notes:
+            parts.append(notes)
+
+    return "\n\n".join(parts).rstrip() + "\n", present, missing
+
+
 # ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
@@ -1006,6 +1196,7 @@ async def run_single_prover(
             previous_verification_file = structural_path
 
     scratchpad_file = os.path.join(proof_dir, "scratchpad.md")
+    proof_steps_dir = steps_dir(proof_dir)
 
     prompt = load_prompt(
         prompts_dir,
@@ -1019,6 +1210,7 @@ async def run_single_prover(
         output_file=output_file,
         output_dir=state.output_dir,
         scratchpad_file=scratchpad_file,
+        proof_steps_dir=proof_steps_dir,
     )
 
     if decomp_logger:
@@ -1051,18 +1243,55 @@ async def run_single_prover(
     # Read the file the agent wrote via tool call
     content = read_file(output_file)
     if not content:
-        # The agent never wrote the file. Its chat response is a usable fallback
-        # only if it actually contains a proof.
+        # No proof.md. Two very different situations look like this and must not
+        # be conflated:
         #
-        # When a session is cut off mid-work -- context or output limit, CLI
-        # crash, hard kill -- the last message is a one-line narration of the
-        # next action, e.g. "Now I have a complete understanding. Let me write a
-        # quick scratchpad note and then create the fixed proof." Promoting that
-        # to proof.md spends an entire proof attempt on something that cannot
-        # pass verification, and save_proof() also mirrors it into the run's
-        # top-level proof.md, so a dead run leaves narration standing in as its
-        # final result.
-        if looks_like_proof(response):
+        #   1. The session ended mid-proof. The step checkpoints show how far it
+        #      got, and whatever it did write is recovered below.
+        #   2. The session ended before any step was written, and the last
+        #      message is narration of the next action ("Let me write the proof
+        #      next"). Promoting that to proof.md spends an entire attempt on
+        #      something that cannot pass verification, and save_proof() would
+        #      also mirror it into the run's top-level proof.md, leaving
+        #      narration standing in as the run's final result.
+        decomposition = state.decomposition
+        if decomposition is None:
+            try:
+                decomposition = state.load_decomposition()
+            except Exception:       # unreadable or invalid YAML
+                decomposition = None
+
+        assembled = assemble_proof_from_steps(proof_dir, problem_file, decomposition)
+
+        if assembled:
+            text, present, missing = assembled
+            if missing:
+                partial_file = os.path.join(proof_dir, "proof_partial.md")
+                write_file(partial_file, text)
+                if decomp_logger:
+                    decomp_logger.log_agent_result(
+                        "single_prover",
+                        f"Interrupted after {len(present)} of "
+                        f"{len(present) + len(missing)} steps (missing "
+                        f"{', '.join(missing)}); kept as "
+                        f"{os.path.basename(partial_file)}",
+                    )
+                raise ProofIncomplete(
+                    f"The prover wrote no proof.md and its step checkpoints "
+                    f"cover {len(present)} of {len(present) + len(missing)} "
+                    f"steps: written {', '.join(present)}; missing "
+                    f"{', '.join(missing)}. The written steps were assembled "
+                    f"into {os.path.basename(partial_file)}.",
+                    present, missing, partial_file,
+                )
+            content = text
+            if decomp_logger:
+                decomp_logger.log_agent_result(
+                    "single_prover",
+                    f"proof.md absent; assembled it from {len(present)} step "
+                    "checkpoints",
+                )
+        elif looks_like_proof(response):
             proof_start = response.find("# Proof")
             content = response[proof_start:] if proof_start >= 0 else response
         else:
@@ -1072,13 +1301,15 @@ async def run_single_prover(
             if decomp_logger:
                 decomp_logger.log_agent_result(
                     "single_prover",
-                    "No proof produced: the agent wrote no file and its "
-                    f"response ({len(response or '')} chars) is not a proof",
+                    "No proof produced: the agent wrote no file, left no step "
+                    f"checkpoints, and its response ({len(response or '')} "
+                    "chars) is not a proof",
                 )
             raise ProofNotProduced(
-                f"The prover wrote no {os.path.basename(output_file)} and its "
-                f"response ({len(response or '')} chars) contains no proof "
-                "structure. Its response was:\n\n" + (response or "").strip()[:600]
+                f"The prover wrote no {os.path.basename(output_file)}, left no "
+                f"usable step checkpoints, and its response "
+                f"({len(response or '')} chars) contains no proof structure. "
+                "Its response was:\n\n" + (response or "").strip()[:600]
             )
 
     if decomp_logger:
@@ -1758,6 +1989,9 @@ async def run_decomposition_prover(
             os.makedirs(proof_dir, exist_ok=True)
             proof_file = os.path.join(proof_dir, "proof.md")
             proof_missing = ""  # set when the prover produced no document
+            proof_partial = ""  # set when checkpoints survived a truncation
+            proof_present_steps: list[str] = []
+            proof_missing_steps: list[str] = []
 
             # === Step 2: Run single prover ===
             if resume_point in ("fresh", "decompose", "decompose_revise", "prove"):
@@ -1781,29 +2015,61 @@ async def run_decomposition_prover(
                         decomp_logger=decomp_logger,
                         tracker=tracker,
                     )
+                except ProofIncomplete as exc:
+                    proof_missing = str(exc)
+                    proof_partial = exc.partial_file
+                    proof_present_steps = exc.present
+                    proof_missing_steps = exc.missing
                 except ProofNotProduced as exc:
                     proof_missing = str(exc)
 
             resume_point = "verify_structural"  # Normal flow continues to verification
 
             if proof_missing:
-                # Nothing to verify. The prover never wrote a document, so a
-                # verification call would spend a full model round-trip
-                # describing a one-line narration as a mathematical failure,
-                # and the regulator would then reason about a report with no
-                # substance behind it. Give the regulator the cause instead.
-                decomp_logger.log(
-                    "Skipping verification: the prover produced no proof document"
-                )
+                # Nothing to verify. Either the prover produced no document at
+                # all, or it produced part of one and the session ended. Both
+                # are interruptions, so a verification call would spend a full
+                # model round-trip describing one as a mathematical failure, and
+                # the regulator would then reason about a report with nothing
+                # behind it. Give the regulator the cause instead.
                 structural_report_file = ""
                 structural_verdict = "CONTINUE"
-                verification_feedback = (
-                    "No verification report exists because the prover produced "
-                    "no proof document to verify. It neither wrote proof.md nor "
-                    "returned a response containing any STEP heading -- the "
-                    "signature of a session that ended before the write (context "
-                    "or output limit, CLI crash, or kill).\n\n" + proof_missing
-                )
+
+                if proof_partial:
+                    decomp_logger.log(
+                        "Skipping verification: the session ended after "
+                        f"{len(proof_present_steps)} of "
+                        f"{len(proof_present_steps) + len(proof_missing_steps)} "
+                        f"steps (missing {', '.join(proof_missing_steps)})"
+                    )
+                    proof_file = proof_partial
+                    verification_feedback = (
+                        "No verification report exists because the prover "
+                        "session ended before the proof was finished. This is an "
+                        "interrupted session, not a failed argument: do not "
+                        "diagnose the missing steps as errors in the plan, and do "
+                        "not read the truncation as evidence that the approach is "
+                        "wrong.\n\n"
+                        "Steps written before the interruption: "
+                        f"{', '.join(proof_present_steps)}.\n"
+                        f"Steps still missing: {', '.join(proof_missing_steps)}.\n"
+                        f"The written steps are assembled at {proof_partial} and "
+                        "may be reused: a new proof attempt can keep them and "
+                        "continue from the first missing step instead of starting "
+                        "over.\n\n" + proof_missing
+                    )
+                else:
+                    decomp_logger.log(
+                        "Skipping verification: the prover produced no proof document"
+                    )
+                    verification_feedback = (
+                        "No verification report exists because the prover produced "
+                        "no proof document to verify. It neither wrote proof.md, nor "
+                        "left any step checkpoints, nor returned a response "
+                        "containing any STEP heading -- the signature of a session "
+                        "that ended before the write (context or output limit, CLI "
+                        "crash, or kill).\n\n" + proof_missing
+                    )
             else:
                 # === Step 3: Structural verification ===
                 decomp_logger.log("Running structural verification")

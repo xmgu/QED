@@ -312,6 +312,7 @@ __pycache__/
 # docs/ is ignored by default (template rule), but review records are tracked.
 docs/*
 !docs/verdict_proof_review.md
+!docs/prover_checkpointing.md
 *.pyc
 
 # Streamlit UI runtime data

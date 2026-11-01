@@ -265,22 +265,70 @@ Use `<key-original-step>` tags to mark nontrivial original work, write heuristic
 
 ## Output Format
 
-Write your proof to:
+Write the proof **incrementally**: the moment a step is finished, write that step
+to its own file, then move on. Do not hold the whole document in context and
+write it once at the end.
+
+The reason is mechanical, not stylistic. A proof of this size takes hours, and a
+session that long can hit a context or output limit before it ends. Whatever is
+already on disk survives that; whatever is only in context does not. Written step
+by step, an interrupted session loses the step it was working on. Written in one
+final pass, it loses everything.
+
+Everything you write goes under:
+
 ```
-{output_file}
+{proof_steps_dir}
 ```
 
-Use this structure:
+| File | Contents | When |
+|------|----------|------|
+| `00_front.md` | `# Proof`, then `## Problem Statement`, then `## Proof` | before STEP1 |
+| `<id>.md` | that step, beginning with `### <id>: <Title>` | the moment the step is finished |
+| `99_notes.md` | `## Unresolved Steps`, `## Key Ideas`, `## Deviations from Decomposition Plan` | last |
+
+Use the ids from `proof_order` **verbatim** as filenames: `STEP1.md`, `STEP7a.md`,
+`STEP7b.md`, `GOAL.md`. Ids are not always plain numbers, and the order is
+`proof_order`, not alphabetical — copying each id exactly is what lets these files
+be assembled into `{output_file}`.
+
+**Write each step file once.** A finished step is never rewritten; corrections go
+into the step you are still working on.
+
+**If a step cannot be proved, still write its file**, and say so inside it:
+
+```markdown
+### STEP6: [Title]
+
+**Claim:** [statement from decomposition]
+
+**Proof:**
+**Status:** not proved.
+**Tried:** [routes attempted, and what each one yielded]
+**Breaks at:** [precise point where the argument fails]
+
+**Dependencies:** [STEP4, STEP5]
+```
+
+An absent file means "the session died here". A file saying `not proved` means
+"this step is genuinely open". Only the second is a statement about the
+mathematics, and only the second reaches a verifier.
+
+### 00_front.md
 
 ```markdown
 # Proof
 
 ## Problem Statement
 
-[Copy the problem from {problem_file} verbatim]
+[problem copied verbatim from {problem_file}]
 
 ## Proof
+```
 
+### A normal step file
+
+```markdown
 ### STEP1: [Title]
 
 **Claim:** [statement from decomposition]
@@ -289,9 +337,11 @@ Use this structure:
 [rigorous proof]
 
 **Dependencies:** [S1, S2, ...]
+```
 
----
+A key step (`is_key_step: true`) additionally wraps the argument:
 
+```markdown
 ### STEP2: [Title] ⭐ KEY STEP
 
 **Claim:** [statement from decomposition]
@@ -302,13 +352,11 @@ Use this structure:
 </key-original-step><heuristics>[Explanation why this step is mathematically correct]</heuristics>
 
 **Dependencies:** [STEP1, S1, ...]
+```
 
----
+The last step file closes the argument:
 
-[Continue for all steps in proof_order...]
-
----
-
+```markdown
 ### GOAL: Main Result
 
 **Claim:** [The original problem statement]
@@ -318,13 +366,18 @@ Use this structure:
 <cite>...</cite> [if using external results]
 
 **Dependencies:** [STEP2, STEP3, ...]
+```
 
+### 99_notes.md
+
+```markdown
 ## Unresolved Steps
 
 [If every step in proof_order is proved, write exactly: "None — all steps proved."
 
 Otherwise list each unresolved step as a bullet group. Do NOT write these as
-`### STEPn:` headers — the step headers above must correspond to completed work.]
+`### STEPn:` headers — the step files above must correspond to work you stand
+behind.]
 
 - **STEP2** — not proved
   - **Tried:** [routes attempted, and what each one yielded]
@@ -339,22 +392,30 @@ Otherwise list each unresolved step as a bullet group. Do NOT write these as
 [If you deviated from the plan, explain why here. Otherwise: "None — followed the decomposition plan."]
 ```
 
+These files are concatenated in `proof_order` to produce `{output_file}`, so the
+result reads as one document — you do not need to write that file yourself, and
+writing it again would only duplicate what is already on disk. The split is a
+writing discipline, not a change in what the proof is: each piece still has to
+stand on its own.
+
 ---
 
 ## Quality Checklist
 
-Before outputting, verify:
+Before finishing, verify:
 
-- [ ] Problem statement copied verbatim from problem file
-- [ ] Every step from decomposition plan is addressed with proper `### STEP_ID:` headers
+- [ ] `00_front.md` written, with the problem statement copied verbatim from the problem file
+- [ ] One file per id in `proof_order`, named exactly as the id (e.g. `STEP7a.md`)
+- [ ] Every step file opens with its `### STEP_ID:` heading
 - [ ] Steps follow the `proof_order` from decomposition
 - [ ] Each step has explicit **Claim**, **Proof**, and **Dependencies**
 - [ ] Key steps (`is_key_step: true`) wrapped in `<key-original-step>` tags, heuristics are there.
-- [ ] Every step is either proved or declared in `## Unresolved Steps` — nothing is silently weakened, replaced by a special case, or disguised
+- [ ] Every step is either proved or carries `**Status:** not proved` with **Tried** and **Breaks at** — nothing is silently weakened, replaced by a special case, or disguised
+- [ ] No step file was rewritten after it was finished
+- [ ] `99_notes.md` written, including an accurate Deviations section
 - [ ] All external results properly cited with `<cite>` tags
 - [ ] No hand-waving ("clearly", "obviously") without justification
 - [ ] Computational checks performed where applicable
-- [ ] Deviations section accurately describes any changes from the plan
 
 ---
 
