@@ -313,6 +313,7 @@ __pycache__/
 docs/*
 !docs/verdict_proof_review.md
 !docs/prover_checkpointing.md
+!docs/token_exhaustion_halt.md
 *.pyc
 
 # Streamlit UI runtime data
