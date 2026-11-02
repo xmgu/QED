@@ -11,6 +11,7 @@ wrapped in ``asyncio`` executors so the main event loop stays non-blocking.
 import asyncio
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -22,16 +23,236 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from compat import decode_kwargs, resolve_cli, run_cli_async  # noqa: E402
 
 
+# ---------------------------------------------------------------------------
+# Failure classification
+# ---------------------------------------------------------------------------
+#
+# ``error_type`` used to name the *mechanism* that failed -- ``non_zero_exit``,
+# ``empty_response`` -- which says nothing about what to do next. When a call
+# ends without a usable result the only useful question is *why*, because the
+# remedies are different: shrink the prompt, raise the output ceiling, pay the
+# bill, or retry. So failures are classified by cause.
+
+TOKEN_CONTEXT = "token_context"      # prompt does not fit the context window
+TOKEN_OUTPUT = "token_output"        # response cut off at the output ceiling
+QUOTA = "quota"                      # credits, rate limit or overload
+SESSION_DIED = "session_died"        # process ended, produced nothing usable
+EMPTY_RESPONSE = "empty_response"
+INCOMPLETE_TURN = "incomplete_turn"  # emitted words, never finished the turn
+UNKNOWN = "unknown"
+
+#: Causes that mean "another attempt costs tokens we do not have". These are
+#: the only ones allowed to stop the whole run; everything else stays a
+#: per-call error that the proof loop already knows how to retry.
+TOKEN_CATEGORIES = (TOKEN_CONTEXT, TOKEN_OUTPUT, QUOTA)
+
+CATEGORY_LABELS = {
+    TOKEN_CONTEXT: "context window exceeded",
+    TOKEN_OUTPUT: "output truncated at the token ceiling",
+    QUOTA: "quota or rate limit exhausted",
+    SESSION_DIED: "session died without producing a result",
+    EMPTY_RESPONSE: "empty response",
+    INCOMPLETE_TURN: "turn never completed",
+    UNKNOWN: "unclassified failure",
+}
+
+_CONTEXT_MARKERS = (
+    "context length", "context_length_exceeded", "context window",
+    "maximum context", "prompt is too long", "prompt too long",
+    "too many tokens", "exceeds the maximum", "input is too long",
+    "token limit exceeded", "reduce the length of the messages",
+)
+_OUTPUT_MARKERS = (
+    "max_tokens", "max output tokens", "maximum output", "output limit",
+    "output token limit", "response was truncated", "truncated by",
+    "finish_reason: length", "finish_reason='length'",
+)
+_QUOTA_MARKERS = (
+    "insufficient_quota", "insufficient quota", "quota exceeded",
+    "exceeded your current quota", "out of credits", "credit balance",
+    "rate limit", "rate_limit", "429", "resource_exhausted",
+    "resource exhausted", "overloaded", "too many requests",
+)
+
+
+def _marker_re(markers: tuple[str, ...]) -> re.Pattern:
+    """Compile markers into one case-insensitive regex.
+
+    A bare ``429`` would match inside any number in a proof, so it is anchored
+    to digit boundaries; the rest are distinctive enough as literals.
+    """
+    parts = [r"(?<!\d)429(?!\d)" if m == "429" else re.escape(m) for m in markers]
+    return re.compile("|".join(parts), re.IGNORECASE)
+
+
+_CONTEXT_RE = _marker_re(_CONTEXT_MARKERS)
+_OUTPUT_RE = _marker_re(_OUTPUT_MARKERS)
+_QUOTA_RE = _marker_re(_QUOTA_MARKERS)
+
+
+def _one_line(text: str, limit: int = 300) -> str:
+    """Collapse arbitrary output into a single readable line."""
+    return " ".join(str(text).split())[:limit]
+
+
+def classify_failure(
+    provider: str,
+    *,
+    stdout: str = "",
+    stderr: str = "",
+    returncode: int | None = None,
+    error_events: list[str] | None = None,
+    completed: bool | None = None,
+) -> tuple[str, list[str]]:
+    """Classify a call that produced no usable result.
+
+    Returns ``(category, evidence)``. ``evidence`` is the short list of signals
+    the decision rests on; it goes into the error message and the halt report so
+    the caller never has to take the category on trust.
+
+    Order matters. A quota message often mentions the request size too, and a
+    truncated response arrives as an error event, so the most specific cause has
+    to be tested first.
+    """
+    evidence = [line for line in (error_events or []) if line]
+    haystack = "\n".join(evidence + [stderr or "", (stdout or "")[-4000:]])
+
+    for regex, category in ((_CONTEXT_RE, TOKEN_CONTEXT),
+                            (_OUTPUT_RE, TOKEN_OUTPUT),
+                            (_QUOTA_RE, QUOTA)):
+        found = regex.search(haystack)
+        if found:
+            evidence.append(f"matched {found.group(0)!r}")
+            return category, evidence
+
+    if returncode not in (None, 0):
+        evidence.append(f"exit code {returncode}")
+    if completed is False:
+        evidence.append("no completion event")
+    if evidence:
+        return SESSION_DIED, evidence
+    if completed is True:
+        return EMPTY_RESPONSE, evidence
+    return UNKNOWN, evidence
+
+
+def save_failure_artifact(
+    working_dir: str,
+    call_name: str,
+    *,
+    provider: str,
+    model: str = "",
+    category: str = UNKNOWN,
+    evidence: list[str] | None = None,
+    stdout: str = "",
+    stderr: str = "",
+    returncode: int | None = None,
+    elapsed: float | None = None,
+) -> str:
+    """Write the raw output of a failed call beside the run's artifacts.
+
+    Until this existed the raw output was simply discarded. The four real
+    crashes in ``run_20261023_103103`` left an empty stderr and nothing else, so
+    afterwards there was no way to tell a dead session from an exhausted window
+    -- the cause had to be guessed. A classifier can only be as good as the
+    evidence it is handed, and this file is the only place that evidence
+    survives.
+
+    Returns the path written, or ``""`` if it could not be written.
+    """
+    try:
+        dump_dir = os.path.join(working_dir, "runner_failures")
+        os.makedirs(dump_dir, exist_ok=True)
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        safe = re.sub(r"[^A-Za-z0-9_.-]+", "_", call_name or provider).strip("_")[:60]
+        path = os.path.join(dump_dir, f"{stamp}_{safe or provider}.log")
+
+        def block(title: str, text: str) -> list[str]:
+            text = (text or "").strip()
+            if not text:
+                return [f"## {title}", "", "(empty)", ""]
+            lines = text.splitlines()
+            if len(lines) > 300:
+                lines = [f"... ({len(lines) - 300} earlier lines omitted)"] + lines[-300:]
+            body = "\n".join(lines)
+            if len(body) > 120000:
+                body = "... (truncated)\n" + body[-120000:]
+            return [f"## {title}", "", "```", body, "```", ""]
+
+        header = [
+            f"# Failure: {CATEGORY_LABELS.get(category, category)}",
+            "",
+            f"**Category:** `{category}`",
+            f"**Provider:** {provider}" + (f" / {model}" if model else ""),
+            f"**Call:** {call_name or '(unnamed)'}",
+            f"**Exit code:** {returncode}",
+            f"**Elapsed:** " + (f"{elapsed:.0f}s" if elapsed is not None else "unknown"),
+            f"**When:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            "",
+            "## Evidence",
+            "",
+        ]
+        header += [f"- {_one_line(e)}" for e in evidence] if evidence else ["- (none)"]
+        header.append("")
+
+        with open(path, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write("\n".join(header + block("Stderr", stderr)
+                               + block("Stdout", stdout)) + "\n")
+        return path
+    except OSError:
+        return ""
+
+
+def _runner_failure(
+    *,
+    provider: str,
+    model: str,
+    call_name: str,
+    working_dir: str,
+    category: str,
+    evidence: list[str],
+    message: str,
+    exit_code: int | None,
+    stderr: str,
+    stdout: str,
+    elapsed: float | None,
+) -> "ModelRunnerError":
+    """Build the exception for a failed call, after preserving its evidence."""
+    raw_log = save_failure_artifact(
+        working_dir, call_name, provider=provider, model=model,
+        category=category, evidence=evidence, stdout=stdout, stderr=stderr,
+        returncode=exit_code, elapsed=elapsed,
+    )
+    cls = TokenExhausted if category in TOKEN_CATEGORIES else ModelRunnerError
+    return cls(
+        provider=provider,
+        error_type=category,
+        message=message,
+        exit_code=exit_code,
+        stderr=stderr,
+        stdout=stdout,
+        category=category,
+        evidence=evidence,
+        raw_log=raw_log,
+        model=model,
+        call_name=call_name,
+        elapsed=elapsed,
+    )
+
+
 class ModelRunnerError(Exception):
     """Raised when a model runner encounters a fatal error.
 
     Attributes:
         provider: The model provider (claude, codex, gemini).
-        error_type: Category of error (subprocess_error, non_zero_exit, json_parse_error, empty_response).
+        error_type: Cause of the failure (see the ``*`` constants above).
         message: Human-readable error message.
         exit_code: Process exit code (if applicable).
         stderr: Stderr output from the CLI (if any).
         stdout: Raw stdout (for debugging).
+        category: Classified cause; mirrors ``error_type``.
+        evidence: Signals the classification rests on.
+        raw_log: Path to the file holding the full raw output.
     """
 
     def __init__(
@@ -42,15 +263,60 @@ class ModelRunnerError(Exception):
         exit_code: int | None = None,
         stderr: str = "",
         stdout: str = "",
+        *,
+        category: str = "",
+        evidence: list[str] | None = None,
+        raw_log: str = "",
+        model: str = "",
+        call_name: str = "",
+        elapsed: float | None = None,
     ):
         self.provider = provider
         self.error_type = error_type
         self.exit_code = exit_code
         self.stderr = stderr
         self.stdout = stdout
+        self.category = category or error_type
+        self.evidence = list(evidence or [])
+        self.raw_log = raw_log
+        self.model = model
+        self.call_name = call_name
+        self.elapsed = elapsed
         super().__init__(message)
 
+    @property
+    def is_token(self) -> bool:
+        """True when the cause is a token budget, not a bad answer."""
+        return self.category in TOKEN_CATEGORIES
+
+    @property
+    def label(self) -> str:
+        return CATEGORY_LABELS.get(self.category, self.category)
+
+    def headline(self) -> str:
+        """One line naming the cause, the call and the model."""
+        kind = "TOKEN EXHAUSTED" if self.is_token else "CALL FAILED"
+        parts = [f"{kind} · {self.label}", self.provider]
+        if self.model:
+            parts[1] = f"{self.provider}/{self.model}"
+        if self.call_name:
+            parts.append(self.call_name)
+        return " · ".join(parts)
+
+    def banner(self) -> str:
+        """Multi-line, evidence-backed summary for consoles and reports."""
+        lines = [self.headline()]
+        for item in self.evidence[:6]:
+            lines.append(f"    evidence: {_one_line(item)}")
+        if self.elapsed is not None:
+            lines.append(f"    elapsed:  {self.elapsed:.0f}s")
+        if self.raw_log:
+            lines.append(f"    raw:      {self.raw_log}")
+        return "\n".join(lines)
+
     def __str__(self):
+        if self.is_token:
+            return self.banner()
         parts = [f"[{self.provider}] {self.error_type}: {self.args[0]}"]
         if self.exit_code is not None:
             parts.append(f"exit_code={self.exit_code}")
@@ -58,7 +324,12 @@ class ModelRunnerError(Exception):
             # Truncate stderr for display
             stderr_preview = self.stderr[:500] + ("..." if len(self.stderr) > 500 else "")
             parts.append(f"stderr={stderr_preview!r}")
-        return " | ".join(parts)
+        text = " | ".join(parts)
+        if self.evidence:
+            text += "\n" + "\n".join(f"    evidence: {_one_line(e)}" for e in self.evidence[:4])
+        if self.raw_log:
+            text += f"\n    raw:      {self.raw_log}"
+        return text
 
     def full_details(self) -> str:
         """Return full error details for logging to file."""
@@ -76,6 +347,18 @@ class ModelRunnerError(Exception):
         if self.stdout:
             lines.extend(["", "## Stdout (first 2000 chars)", "```", self.stdout[:2000], "```"])
         return "\n".join(lines)
+
+
+class TokenExhausted(ModelRunnerError):
+    """The call failed because a token budget ran out.
+
+    A distinct subclass rather than a flag, so a caller can write
+    ``except TokenExhausted`` and stop the run, while every other runner error
+    keeps its old meaning: "the model produced something unusable", which the
+    proof loop already knows how to retry. Spending the remaining proof attempts
+    on a context window that will not grow is not a mathematical decision, and
+    should not be recorded as one.
+    """
 
 
 # ---------------------------------------------------------------------------
@@ -142,10 +425,12 @@ async def run_claude_agent(
             if logger:
                 logger.log(f"[Claude] EXCEPTION (attempt {attempt}/{MAX_RETRIES}): "
                            f"{type(exc).__name__}: {exc}")
-            last_error = ModelRunnerError(
-                provider="claude",
-                error_type="subprocess_error",
+            last_error = _runner_failure(
+                provider="claude", model=model, call_name=call_name,
+                working_dir=working_dir, category="subprocess_error",
+                evidence=[f"{type(exc).__name__}: {exc}"],
                 message=f"Failed to execute Claude CLI: {type(exc).__name__}: {exc}",
+                exit_code=None, stderr="", stdout="", elapsed=elapsed,
             )
             if attempt < MAX_RETRIES:
                 wait = RETRY_BACKOFF[attempt - 1]
@@ -156,7 +441,8 @@ async def run_claude_agent(
             if tracker:
                 tracker.record(call_name or "claude", 0, 0,
                                (datetime.now() - start).total_seconds(),
-                               provider="claude", model=model)
+                               provider="claude", model=model,
+                               outcome="subprocess_error")
             raise last_error
 
         elapsed = (datetime.now() - attempt_start).total_seconds()
@@ -170,10 +456,16 @@ async def run_claude_agent(
         input_tokens = 0
         output_tokens = 0
         json_parse_error = None
+        is_error = False
+        subtype = ""
 
         try:
             data = json.loads(result.stdout)
-            response = data.get("result", "")
+            if not isinstance(data, dict):
+                data = {}
+            response = data.get("result") or ""
+            is_error = bool(data.get("is_error"))
+            subtype = str(data.get("subtype") or "")
 
             for _, model_stats in data.get("modelUsage", {}).items():
                 input_tokens += model_stats.get("inputTokens", 0)
@@ -186,55 +478,103 @@ async def run_claude_agent(
                     logger.log(f"[Claude] Raw stdout (first 1000 chars): {result.stdout.strip()[:1000]}")
             response = result.stdout.strip()
 
-        # Check for non-zero exit code (indicates CLI failure) — retryable
-        if result.returncode != 0:
-            if logger:
-                logger.log(f"[Claude] Non-zero exit code: {result.returncode} "
-                           f"(attempt {attempt}/{MAX_RETRIES})")
-            last_error = ModelRunnerError(
-                provider="claude",
-                error_type="non_zero_exit",
-                message=f"Claude CLI exited with code {result.returncode}",
-                exit_code=result.returncode,
-                stderr=result.stderr,
-                stdout=result.stdout,
+        def _make_error(category: str, evidence: list[str], message: str):
+            return _runner_failure(
+                provider="claude", model=model, call_name=call_name,
+                working_dir=working_dir, category=category, evidence=evidence,
+                message=message, exit_code=result.returncode,
+                stderr=result.stderr, stdout=result.stdout,
+                elapsed=(datetime.now() - start).total_seconds(),
             )
+
+        def _record(category: str):
+            if tracker:
+                tracker.record(call_name or "claude", input_tokens, output_tokens,
+                               (datetime.now() - start).total_seconds(),
+                               provider="claude", model=model, outcome=category)
+
+        async def _retry_or_raise(error, category: str):
+            if category in TOKEN_CATEGORIES:
+                # Re-buying the same failure only makes it more expensive.
+                if logger:
+                    logger.log(f"[Claude] Not retrying: "
+                               f"{CATEGORY_LABELS.get(category, category)}")
+                _record(category)
+                raise error
             if attempt < MAX_RETRIES:
                 wait = RETRY_BACKOFF[attempt - 1]
                 if logger:
                     logger.log(f"[Claude] Retrying in {wait}s...")
                 await asyncio.sleep(wait)
-                continue
-            if tracker:
-                tracker.record(call_name or "claude", input_tokens, output_tokens,
-                               (datetime.now() - start).total_seconds(),
-                               provider="claude", model=model)
-            raise last_error
+                return
+            _record(category)
+            raise error
+
+        # Claude reports failures *inside* a zero-exit JSON envelope:
+        #   {"is_error": true, "subtype": "error_max_turns", "result": "..."}
+        # Left alone, `result` -- the error text -- becomes the agent's
+        # "response", and a context overflow is filed as a bad proof.
+        if is_error or subtype.startswith("error"):
+            if subtype == "error_max_budget_usd":
+                # A spend ceiling, not a window: the account cannot buy more.
+                category, evidence = QUOTA, [f"subtype={subtype}"]
+            else:
+                # ``error_max_turns`` is a turn budget, not a token one. It is
+                # left to the text classifier on purpose: calling it a token
+                # failure would be a confident wrong answer.
+                category, evidence = classify_failure(
+                    "claude", stdout=result.stdout, stderr=result.stderr,
+                    returncode=result.returncode,
+                    error_events=[f"is_error=true subtype={subtype or 'unknown'}",
+                                  response],
+                    completed=False,
+                )
+            if logger:
+                logger.log(f"[Claude] CLI reported {subtype or 'an error'} "
+                           f"(attempt {attempt}/{MAX_RETRIES}, {category})")
+            await _retry_or_raise(
+                _make_error(category, evidence,
+                            f"Claude reported {subtype or 'an error'}"),
+                category,
+            )
+            continue
+
+        # Check for non-zero exit code (indicates CLI failure) — retryable
+        if result.returncode != 0:
+            category, evidence = classify_failure(
+                "claude", stdout=result.stdout, stderr=result.stderr,
+                returncode=result.returncode,
+                error_events=[f"subtype={subtype}"] if subtype else [],
+                completed=False,
+            )
+            if logger:
+                logger.log(f"[Claude] Non-zero exit code: {result.returncode} "
+                           f"(attempt {attempt}/{MAX_RETRIES}, {category})")
+            await _retry_or_raise(
+                _make_error(category, evidence,
+                            f"Claude CLI exited with code {result.returncode}"),
+                category,
+            )
+            continue
 
         # Check for empty response (might indicate silent failure) — retryable
         if not response.strip():
+            category, evidence = classify_failure(
+                "claude", stdout=result.stdout, stderr=result.stderr,
+                returncode=result.returncode,
+                error_events=[f"JSON parse error: {json_parse_error}"] if json_parse_error else [],
+                completed=True,
+            )
             if logger:
                 logger.log(f"[Claude] Empty response received "
-                           f"(attempt {attempt}/{MAX_RETRIES})")
-            last_error = ModelRunnerError(
-                provider="claude",
-                error_type="empty_response",
-                message="Claude returned empty response" + (f" (JSON parse error: {json_parse_error})" if json_parse_error else ""),
-                exit_code=result.returncode,
-                stderr=result.stderr,
-                stdout=result.stdout,
+                           f"(attempt {attempt}/{MAX_RETRIES}, {category})")
+            await _retry_or_raise(
+                _make_error(category, evidence,
+                            "Claude returned empty response"
+                            + (f" (JSON parse error: {json_parse_error})" if json_parse_error else "")),
+                category,
             )
-            if attempt < MAX_RETRIES:
-                wait = RETRY_BACKOFF[attempt - 1]
-                if logger:
-                    logger.log(f"[Claude] Retrying in {wait}s...")
-                await asyncio.sleep(wait)
-                continue
-            if tracker:
-                tracker.record(call_name or "claude", input_tokens, output_tokens,
-                               (datetime.now() - start).total_seconds(),
-                               provider="claude", model=model)
-            raise last_error
+            continue
 
         # Success — break out of retry loop
         if attempt > 1 and logger:
@@ -304,11 +644,13 @@ async def run_codex_agent(
             logger.log(f"[Codex] EXCEPTION: {type(exc).__name__}: {exc}")
         if tracker:
             tracker.record(call_name or "codex", 0, 0, elapsed,
-                           provider="codex", model=model)
-        raise ModelRunnerError(
-            provider="codex",
-            error_type="subprocess_error",
+                           provider="codex", model=model, outcome="subprocess_error")
+        raise _runner_failure(
+            provider="codex", model=model, call_name=call_name,
+            working_dir=working_dir, category="subprocess_error",
+            evidence=[f"{type(exc).__name__}: {exc}"],
             message=f"Failed to execute Codex CLI: {type(exc).__name__}: {exc}",
+            exit_code=None, stderr="", stdout="", elapsed=elapsed,
         )
 
     elapsed = (datetime.now() - start).total_seconds()
@@ -324,6 +666,7 @@ async def run_codex_agent(
     json_parse_error = None
     turn_completed = False
     messages_seen = 0
+    error_events: list[str] = []
 
     try:
         lines = result.stdout.strip().split("\n")
@@ -344,6 +687,14 @@ async def run_codex_agent(
                 usage = event.get("usage", {})
                 input_tokens += usage.get("input_tokens", 0)
                 output_tokens += usage.get("output_tokens", 0)
+            elif event.get("type") in ("error", "turn.failed"):
+                # The only place a JSONL session states its own cause. It used
+                # to be dropped on the floor: only agent_message and
+                # turn.completed were read, so a context overflow and a killed
+                # process looked identical from the outside.
+                detail = event.get("message") or (event.get("error") or {}).get("message")
+                error_events.append(
+                    f"{event.get('type')}: {detail or json.dumps(event)[:400]}")
     except (json.JSONDecodeError, ValueError) as exc:
         json_parse_error = str(exc)
         if logger:
@@ -357,13 +708,52 @@ async def run_codex_agent(
     # early: the CLI hit its context or output ceiling, crashed, or was killed.
     # token_usage then records 0/0 (no usage event), and the surviving
     # response is whatever the last message happened to be.
+    #
+    # This is not fatal -- the caller's looks_like_proof decides whether the
+    # text is an artifact. But the raw session is kept, because "emitted words,
+    # then stopped with no usage event" is exactly the shape a swallowed
+    # context error takes, and it is the only way to tell afterwards.
+    outcome = "ok"
     if response.strip() and not turn_completed:
+        outcome = INCOMPLETE_TURN
+        raw = save_failure_artifact(
+            working_dir, call_name, provider="codex", model=model,
+            category=INCOMPLETE_TURN,
+            evidence=[f"{messages_seen} message(s), no turn.completed event",
+                      *error_events],
+            stdout=result.stdout, stderr=result.stderr,
+            returncode=result.returncode, elapsed=elapsed,
+        )
         if logger:
             logger.log(
                 f"[Codex] Warning: turn did not complete ({messages_seen} "
                 "message(s) seen, no turn.completed event) — the captured "
                 "response is the last message emitted, not necessarily a "
-                "finished answer"
+                "finished answer" + (f"; raw session kept at {raw}" if raw else "")
+            )
+
+    # A turn that failed for a token reason is not an answer, even if it
+    # narrated something first. The last agent_message of a failed turn is
+    # mid-work commentary; returning it would hand the caller a "response" that
+    # looks like progress and files a budget problem as a bad proof.
+    if error_events:
+        category, evidence = classify_failure(
+            "codex", stdout=result.stdout, stderr=result.stderr,
+            returncode=result.returncode, error_events=error_events,
+            completed=turn_completed,
+        )
+        if category in TOKEN_CATEGORIES:
+            if logger:
+                logger.log(f"[Codex] Failure: {category}")
+            if tracker:
+                tracker.record(call_name or "codex", input_tokens, output_tokens,
+                               elapsed, provider="codex", model=model, outcome=category)
+            raise _runner_failure(
+                provider="codex", model=model, call_name=call_name,
+                working_dir=working_dir, category=category, evidence=evidence,
+                message=evidence[0] if evidence else "Codex turn failed",
+                exit_code=result.returncode, stderr=result.stderr,
+                stdout=result.stdout, elapsed=elapsed,
             )
 
     # The Codex CLI sometimes exits non-zero (e.g. "Reading additional input
@@ -376,32 +766,41 @@ async def run_codex_agent(
                        f"(treating as warning since response was parsed)" if response.strip()
                        else f"[Codex] Non-zero exit code: {result.returncode}")
         if not response.strip():
+            category, evidence = classify_failure(
+                "codex", stdout=result.stdout, stderr=result.stderr,
+                returncode=result.returncode, error_events=error_events,
+                completed=turn_completed,
+            )
             if tracker:
                 tracker.record(call_name or "codex", input_tokens, output_tokens,
-                               elapsed, provider="codex", model=model)
-            raise ModelRunnerError(
-                provider="codex",
-                error_type="non_zero_exit",
+                               elapsed, provider="codex", model=model, outcome=category)
+            raise _runner_failure(
+                provider="codex", model=model, call_name=call_name,
+                working_dir=working_dir, category=category, evidence=evidence,
                 message=f"Codex CLI exited with code {result.returncode}",
-                exit_code=result.returncode,
-                stderr=result.stderr,
-                stdout=result.stdout,
+                exit_code=result.returncode, stderr=result.stderr,
+                stdout=result.stdout, elapsed=elapsed,
             )
 
     # Check for empty response (might indicate silent failure)
     if not response.strip():
+        category, evidence = classify_failure(
+            "codex", stdout=result.stdout, stderr=result.stderr,
+            returncode=result.returncode, error_events=error_events,
+            completed=turn_completed,
+        )
         if logger:
-            logger.log(f"[Codex] Empty response received")
+            logger.log(f"[Codex] Empty response received ({category})")
         if tracker:
             tracker.record(call_name or "codex", input_tokens, output_tokens,
-                           elapsed, provider="codex", model=model)
-        raise ModelRunnerError(
-            provider="codex",
-            error_type="empty_response",
-            message="Codex returned empty response" + (f" (JSON parse error: {json_parse_error})" if json_parse_error else ""),
-            exit_code=result.returncode,
-            stderr=result.stderr,
-            stdout=result.stdout,
+                           elapsed, provider="codex", model=model, outcome=category)
+        raise _runner_failure(
+            provider="codex", model=model, call_name=call_name,
+            working_dir=working_dir, category=category, evidence=evidence,
+            message="Codex returned empty response"
+                    + (f" (JSON parse error: {json_parse_error})" if json_parse_error else ""),
+            exit_code=result.returncode, stderr=result.stderr,
+            stdout=result.stdout, elapsed=elapsed,
         )
 
     if logger:
@@ -410,7 +809,7 @@ async def run_codex_agent(
 
     if tracker:
         tracker.record(call_name or "codex", input_tokens, output_tokens,
-                       elapsed, provider="codex", model=model)
+                       elapsed, provider="codex", model=model, outcome=outcome)
 
     return response
 
@@ -444,6 +843,19 @@ async def run_gemini_agent(
     approval_mode = gemini_config.get("approval_mode", "yolo")
     thinking_level = gemini_config.get("thinking_level", "")
     thinking_budget = gemini_config.get("thinking_budget")
+
+    # ``thinking_config`` used to be read here without ever being assigned, so
+    # every Gemini call died with NameError before the CLI was even spawned.
+    # That matters most in exactly the situation this module now reports: when
+    # Codex runs out of tokens and the role is pointed at Gemini instead.
+    thinking_config = {}
+    if thinking_level:
+        thinking_config["thinkingLevel"] = str(thinking_level).upper()
+    elif thinking_budget is not None:
+        try:
+            thinking_config["thinkingBudget"] = int(thinking_budget)
+        except (TypeError, ValueError):
+            thinking_config = {}
 
     cmd = [
         cli_path,
@@ -500,11 +912,13 @@ async def run_gemini_agent(
             logger.log(f"[Gemini] EXCEPTION: {type(exc).__name__}: {exc}")
         if tracker:
             tracker.record(call_name or "gemini", 0, 0, elapsed,
-                           provider="gemini", model=model)
-        raise ModelRunnerError(
-            provider="gemini",
-            error_type="subprocess_error",
+                           provider="gemini", model=model, outcome="subprocess_error")
+        raise _runner_failure(
+            provider="gemini", model=model, call_name=call_name,
+            working_dir=working_dir, category="subprocess_error",
+            evidence=[f"{type(exc).__name__}: {exc}"],
             message=f"Failed to execute Gemini CLI: {type(exc).__name__}: {exc}",
+            exit_code=None, stderr="", stdout="", elapsed=elapsed,
         )
 
     elapsed = (datetime.now() - start).total_seconds()
@@ -518,10 +932,18 @@ async def run_gemini_agent(
     input_tokens = 0
     output_tokens = 0
     json_parse_error = None
+    error_events: list[str] = []
 
     try:
         data = json.loads(result.stdout)
-        response = data.get("response", "")
+        if not isinstance(data, dict):
+            data = {}
+        response = data.get("response") or ""
+        if data.get("error"):
+            err = data["error"]
+            detail = err.get("message") if isinstance(err, dict) else str(err)
+            code = err.get("code") if isinstance(err, dict) else ""
+            error_events.append(f"error {code}: {detail}")
 
         for _, model_stats in data.get("stats", {}).get("models", {}).items():
             tokens = model_stats.get("tokens", {})
@@ -536,36 +958,45 @@ async def run_gemini_agent(
                 logger.log(f"[Gemini] Raw stdout (first 1000 chars): {result.stdout.strip()[:1000]}")
         response = result.stdout.strip()
 
-    # Check for non-zero exit code (indicates CLI failure)
-    if result.returncode != 0:
+    # An error envelope carries no response, so it is a failure even at exit 0.
+    if error_events or (result.returncode != 0 and not response.strip()):
+        category, evidence = classify_failure(
+            "gemini", stdout=result.stdout, stderr=result.stderr,
+            returncode=result.returncode, error_events=error_events,
+            completed=False,
+        )
         if logger:
-            logger.log(f"[Gemini] Non-zero exit code: {result.returncode}")
+            logger.log(f"[Gemini] Failure: {category}")
         if tracker:
             tracker.record(call_name or "gemini", input_tokens, output_tokens,
-                           elapsed, provider="gemini", model=model)
-        raise ModelRunnerError(
-            provider="gemini",
-            error_type="non_zero_exit",
-            message=f"Gemini CLI exited with code {result.returncode}",
-            exit_code=result.returncode,
-            stderr=result.stderr,
-            stdout=result.stdout,
+                           elapsed, provider="gemini", model=model, outcome=category)
+        raise _runner_failure(
+            provider="gemini", model=model, call_name=call_name,
+            working_dir=working_dir, category=category, evidence=evidence,
+            message=f"Gemini CLI exited with code {result.returncode}"
+                    if result.returncode != 0 else "Gemini reported an error",
+            exit_code=result.returncode, stderr=result.stderr,
+            stdout=result.stdout, elapsed=elapsed,
         )
 
     # Check for empty response (might indicate silent failure)
     if not response.strip():
+        category, evidence = classify_failure(
+            "gemini", stdout=result.stdout, stderr=result.stderr,
+            returncode=result.returncode, completed=True,
+        )
         if logger:
-            logger.log(f"[Gemini] Empty response received")
+            logger.log(f"[Gemini] Empty response received ({category})")
         if tracker:
             tracker.record(call_name or "gemini", input_tokens, output_tokens,
-                           elapsed, provider="gemini", model=model)
-        raise ModelRunnerError(
-            provider="gemini",
-            error_type="empty_response",
-            message="Gemini returned empty response" + (f" (JSON parse error: {json_parse_error})" if json_parse_error else ""),
-            exit_code=result.returncode,
-            stderr=result.stderr,
-            stdout=result.stdout,
+                           elapsed, provider="gemini", model=model, outcome=category)
+        raise _runner_failure(
+            provider="gemini", model=model, call_name=call_name,
+            working_dir=working_dir, category=category, evidence=evidence,
+            message="Gemini returned empty response"
+                    + (f" (JSON parse error: {json_parse_error})" if json_parse_error else ""),
+            exit_code=result.returncode, stderr=result.stderr,
+            stdout=result.stdout, elapsed=elapsed,
         )
 
     if logger:

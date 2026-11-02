@@ -26,8 +26,35 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from model_runner import run_model, run_model_for_agent, run_claude_agent, ModelRunnerError
+from model_runner import (
+    run_model,
+    run_model_for_agent,
+    run_claude_agent,
+    ModelRunnerError,
+    TokenExhausted,
+    CATEGORY_LABELS,
+    TOKEN_CATEGORIES,
+)
 from compat import read_text, write_text
+
+
+#: Exit code used when the run stops because a call cannot be paid for again.
+#: Deliberately distinct from 1 so the UI can tell "halted, resumable" apart
+#: from "crashed or exhausted its attempts".
+HALT_EXIT_CODE = 3
+
+
+class RunHalted(Exception):
+    """The run stopped because a call could not be bought again.
+
+    Carries the report that was written to disk so the entry point can print it
+    without re-deriving anything, and so a caller in another process can read
+    ``halt.json`` instead of parsing the console.
+    """
+
+    def __init__(self, report: dict):
+        self.report = report or {}
+        super().__init__(self.report.get("summary", "run halted"))
 
 
 # ---------------------------------------------------------------------------
@@ -526,14 +553,48 @@ class DecompositionLogger:
         self.status_file = os.path.join(self.decomp_dir, "STATUS.md")
         self.main_log_file = os.path.join(self.decomp_dir, "log.txt")
 
-        # Initialize status
-        self._write_status({
+        # Adopt whatever is already on disk. Constructing a logger used to
+        # overwrite STATUS.md with attempt/revision/proof = 1, so a second
+        # logger in the same run (a resume, or the halt report) erased the real
+        # position the UI was showing.
+        self._status = self._read_status() or {
             "state": "STARTING",
             "attempt": 1,
             "revision": 1,
             "proof": 1,
-            "last_update": datetime.now().isoformat(),
-        })
+            "recent_activity": "",
+        }
+        self._status["last_update"] = datetime.now().isoformat()
+        self._write_status(self._status)
+
+    _STATUS_ROW_RE = re.compile(
+        r"^\|\s*(State|Attempt|Revision|Proof)\s*\|\s*([^|]*)\|", re.M)
+
+    def _read_status(self) -> dict | None:
+        """Parse STATUS.md back into fields, or None if it is not usable."""
+        if not os.path.exists(self.status_file):
+            return None
+        try:
+            text = read_text(self.status_file)
+        except OSError:
+            return None
+
+        rows = {m.group(1).lower(): m.group(2).strip()
+                for m in self._STATUS_ROW_RE.finditer(text)}
+        if not rows:
+            return None
+
+        status = {"state": rows.get("state", "UNKNOWN"), "recent_activity": ""}
+        for key in ("attempt", "revision", "proof"):
+            try:
+                status[key] = int(rows.get(key, 1))
+            except (TypeError, ValueError):
+                status[key] = 1
+
+        activity = re.search(r"##\s*Recent Activity\s*\n+(.*)", text, re.S)
+        if activity:
+            status["recent_activity"] = activity.group(1).strip()
+        return status
 
     def _timestamp(self) -> str:
         return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -567,33 +628,27 @@ class DecompositionLogger:
         proof: int = None,
         recent_activity: str = None,
     ) -> None:
-        """Update the status file with current state."""
-        # Read existing status
-        existing = {}
-        if os.path.exists(self.status_file):
-            # Parse existing values (simple approach)
-            existing = {
-                "state": "UNKNOWN",
-                "attempt": 1,
-                "revision": 1,
-                "proof": 1,
-                "recent_activity": "",
-            }
+        """Update the status file, keeping fields the caller did not pass.
 
-        # Update with new values
+        Callers only pass what they know -- a halt passes a state and a reason.
+        The previous implementation re-read the file to fill the rest but its
+        parse produced defaults only, so every such call reset attempt,
+        revision and proof to 1. That is exactly the moment the user is looking
+        at those numbers, so the reset was maximally confusing.
+        """
         if state is not None:
-            existing["state"] = state
+            self._status["state"] = state
         if attempt is not None:
-            existing["attempt"] = attempt
+            self._status["attempt"] = attempt
         if revision is not None:
-            existing["revision"] = revision
+            self._status["revision"] = revision
         if proof is not None:
-            existing["proof"] = proof
+            self._status["proof"] = proof
         if recent_activity is not None:
-            existing["recent_activity"] = recent_activity
+            self._status["recent_activity"] = recent_activity
 
-        existing["last_update"] = datetime.now().isoformat()
-        self._write_status(existing)
+        self._status["last_update"] = datetime.now().isoformat()
+        self._write_status(self._status)
 
     def log(self, message: str, agent: str = None) -> None:
         """Log a message to the main timeline log."""
@@ -1830,7 +1885,7 @@ async def run_verdict(
 # Main orchestration
 # ---------------------------------------------------------------------------
 
-async def run_decomposition_prover(
+async def _run_decomposition_prover(
     problem_file: str,
     related_work_file: str,
     output_dir: str,
@@ -1840,7 +1895,7 @@ async def run_decomposition_prover(
     logger=None,
     tracker=None,
 ) -> str:
-    """Main entry point for decomposition-based proving.
+    """Body of the decomposition loop. Use :func:`run_decomposition_prover`.
 
     Simplified pipeline:
     1. Decomposer creates a proof plan (decomposition)
@@ -2456,6 +2511,242 @@ async def run_decomposition_prover(
     )
 
     return ""
+
+
+# ---------------------------------------------------------------------------
+# Halt path: a call that cannot be paid for again stops the run
+# ---------------------------------------------------------------------------
+
+def _position_on_disk(output_dir: str) -> tuple[str, dict]:
+    """Return the proof directory the run was last working in, and its position.
+
+    The halt can fire at any call, so the position is read from disk rather than
+    from a state object that may never have existed.
+    """
+    info = detect_decomposition_resume(output_dir)
+    attempt = int(info.get("attempt") or 1)
+    revision = int(info.get("revision") or 1)
+    revision_dir = os.path.join(
+        output_dir, "decomposition", f"attempt_{attempt}", f"revision_{revision}")
+    proof_no = _find_max_numbered_dir(revision_dir, "proof_")
+    position = {"attempt": attempt, "revision": revision,
+                "proof": proof_no or int(info.get("proof") or 1)}
+    if proof_no <= 0:
+        return "", position
+    return os.path.join(revision_dir, f"proof_{proof_no}"), position
+
+
+def _load_decomposition(revision_dir: str) -> dict | None:
+    path = os.path.join(revision_dir, "decomposition.yaml")
+    if not os.path.exists(path):
+        return None
+    try:
+        return parse_decomposition(read_file(path))
+    except Exception:
+        return None
+
+
+def halt_run(output_dir: str, exc: TokenExhausted, *, problem_file: str = "") -> dict:
+    """Stop the run at a resumable boundary and write down why.
+
+    Three things have to happen together, or the stop is worse than a crash:
+
+    1. ``proof_partial.md`` is assembled from whatever steps survived. P1's
+       resume rule only recognises an interruption when that file exists and
+       ``proof.md`` does not -- and it is normally written at the *end* of a
+       prover call, which this path never reaches. Without it the checkpoints
+       sit on disk and nothing marks them as resumable.
+    2. ``STATUS.md`` says HALTED, so the UI's existing panel shows the reason
+       without any new plumbing.
+    3. ``HALT.md`` / ``halt.json`` record the category, the evidence and the
+       raw output path, so the cause survives the process.
+
+    Returns the report dict that was written to ``halt.json``.
+    """
+    now = datetime.now()
+    proof_dir, position = _position_on_disk(output_dir)
+    revision_dir = os.path.join(
+        output_dir, "decomposition",
+        f"attempt_{position['attempt']}", f"revision_{position['revision']}")
+    decomposition = _load_decomposition(revision_dir)
+
+    present: list[str] = []
+    missing: list[str] = []
+    partial_path = ""
+    final_proof = os.path.join(proof_dir, "proof.md") if proof_dir else ""
+
+    if proof_dir and os.path.isdir(proof_dir):
+        try:
+            text, present, missing = assemble_proof_from_steps(
+                proof_dir, problem_file, decomposition)
+        except Exception:
+            text, present, missing = "", [], []
+        # Only when the attempt is genuinely unfinished: a judged proof.md must
+        # keep winning, or the next resume would re-prove work already rejected.
+        if text.strip() and not os.path.exists(final_proof):
+            partial_path = os.path.join(proof_dir, "proof_partial.md")
+            write_file(partial_path, text)
+
+    summary = (f"TOKEN EXHAUSTED · {CATEGORY_LABELS.get(exc.category, exc.category)}"
+               f" · {exc.provider}" + (f"/{exc.model}" if exc.model else "")
+               + (f" · {exc.call_name}" if exc.call_name else ""))
+
+    report = {
+        "halted_at": now.strftime("%Y-%m-%d %H:%M:%S"),
+        "summary": summary,
+        "category": exc.category,
+        "label": CATEGORY_LABELS.get(exc.category, exc.category),
+        "provider": exc.provider,
+        "model": exc.model,
+        "call_name": exc.call_name,
+        "exit_code": exc.exit_code,
+        "elapsed_s": round(exc.elapsed, 1) if exc.elapsed is not None else None,
+        "evidence": exc.evidence,
+        "raw_log": exc.raw_log,
+        "attempt": position["attempt"],
+        "revision": position["revision"],
+        "proof": position["proof"],
+        "resume_point": "prove",
+        "proof_partial": partial_path,
+        "checkpoints_present": present,
+        "checkpoints_missing": missing,
+        "attempts_consumed": False,
+        "output_dir": output_dir,
+    }
+
+    md_path = os.path.join(output_dir, "HALT.md")
+    report["halt_md"] = md_path
+    write_file(md_path, _halt_markdown(report, problem_file))
+
+    try:
+        with open(os.path.join(output_dir, "halt.json"), "w", encoding="utf-8") as fh:
+            json.dump(report, fh, indent=2)
+    except OSError:
+        pass
+
+    # The UI already renders decomposition/STATUS.md verbatim.
+    try:
+        DecompositionLogger(output_dir).update_status(
+            state="HALTED",
+            recent_activity=f"{summary} — nothing lost, resume to continue",
+        )
+    except OSError:
+        pass
+
+    return report
+
+
+def _halt_markdown(report: dict, problem_file: str) -> str:
+    """Render the human-readable half of the halt record."""
+    lines = [
+        f"# RUN HALTED — {report['summary'].split(' · ')[0]}",
+        "",
+        "| | |",
+        "|---|---|",
+        f"| **Cause** | `{report['category']}` — {report['label']} |",
+        f"| **Call** | {report['call_name'] or '(unknown)'} |",
+        f"| **Provider** | {report['provider']}"
+        + (f" / {report['model']}" if report['model'] else "") + " |",
+        f"| **Position** | attempt {report['attempt']} / revision {report['revision']}"
+        f" / proof {report['proof']} |",
+        f"| **Exit code** | {report['exit_code']} |",
+        f"| **Elapsed** | "
+        + (f"{report['elapsed_s']:.0f}s" if report['elapsed_s'] is not None else "unknown")
+        + " |",
+        f"| **When** | {report['halted_at']} |",
+        "",
+        "## Why this category",
+        "",
+    ]
+    if report["evidence"]:
+        lines += ["- " + " ".join(str(e).split())[:300] for e in report["evidence"]]
+    else:
+        lines.append("- (no evidence captured)")
+    lines += [
+        "",
+        "## Raw output",
+        "",
+        f"`{report['raw_log']}`" if report["raw_log"]
+        else "The raw stdout/stderr of this call was not captured.",
+        "",
+        "## What was preserved",
+        "",
+    ]
+    if report["proof_partial"]:
+        lines.append(f"- `{report['proof_partial']}` — assembled from the steps "
+                     "that had been written")
+    else:
+        lines.append("- no partial proof (no finished step was on disk)")
+    lines.append("- finished steps: "
+                 + (", ".join(report["checkpoints_present"]) or "none"))
+    lines.append("- still missing: "
+                 + (", ".join(report["checkpoints_missing"]) or "none"))
+    lines += [
+        "",
+        "## What did not run",
+        "",
+        "Structural verification, detailed verification, the regulator, and the "
+        "proof effort summary. The run stopped between calls: nothing inside a "
+        "CLI session was interrupted.",
+        "",
+        "## What was not spent",
+        "",
+        f"- proof attempts: **not consumed** (still proof {report['proof']} of the",
+        "  configured maximum)",
+        "- no retry was attempted: this category does not heal on its own",
+        "",
+        "## Next step",
+        "",
+        "Resume the same command; the prover continues from the first missing "
+        "step instead of rewriting the finished ones:",
+        "",
+        "```",
+        f"python code/run.py {problem_file or 'problem/problem.tex'} {report['output_dir']}",
+        "```",
+        "",
+        "If this is a quota failure, top up or point the role at another provider "
+        "in `config.yaml` first — resuming immediately would fail the same way.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+async def run_decomposition_prover(
+    problem_file: str,
+    related_work_file: str,
+    output_dir: str,
+    config: dict,
+    prompts_dir: str,
+    claude_opts: dict,
+    logger=None,
+    tracker=None,
+) -> str:
+    """Main entry point for decomposition-based proving.
+
+    Thin wrapper whose only job is the halt path: a :class:`TokenExhausted`
+    escaping the loop means no further call can succeed, so the run is parked
+    and re-raised as :class:`RunHalted` instead of unwinding as a traceback.
+    Every other error keeps its previous behaviour.
+    """
+    try:
+        return await _run_decomposition_prover(
+            problem_file=problem_file,
+            related_work_file=related_work_file,
+            output_dir=output_dir,
+            config=config,
+            prompts_dir=prompts_dir,
+            claude_opts=claude_opts,
+            logger=logger,
+            tracker=tracker,
+        )
+    except TokenExhausted as exc:
+        report = halt_run(output_dir, exc, problem_file=problem_file)
+        if logger:
+            try:
+                logger.log(f"HALTED: {report['summary']}")
+            except Exception:
+                pass
+        raise RunHalted(report) from exc
 
 
 # ---------------------------------------------------------------------------

@@ -25,7 +25,11 @@ from decomposition_prover import (
     interrupted_partial,
     step_order,
     steps_dir,
+    halt_run,
+    DecompositionLogger,
+    HALT_EXIT_CODE,
 )
+from model_runner import TokenExhausted, ModelRunnerError
 from compat import decode_kwargs, read_text, resolve_cli, write_text
 
 
@@ -465,6 +469,181 @@ async def run_smoke_test(config: dict, config_path: str | None = None) -> bool:
         check("the carried file keeps the current session's text",
               "### STEP2: Checkpoint" in
               read_text(os.path.join(steps_dir(resumed), "STEP2.md")))
+
+    # -------------------------------------------------------
+    # Test 3f: Failure classification
+    # -------------------------------------------------------
+    print("\n=== Test 3f: Failure classification ===")
+    import model_runner as mr
+
+    class _CliResult:
+        def __init__(self, stdout="", stderr="", returncode=0):
+            self.stdout = stdout
+            self.stderr = stderr
+            self.returncode = returncode
+
+    real_run_cli_async = mr.run_cli_async
+
+    def stub_cli(result):
+        async def _fake(cmd, **kwargs):
+            return result
+        mr.run_cli_async = _fake
+
+    try:
+        # The exact shape of the four real crashes in run_20261023_103103:
+        # exit 1, an empty or single-line stderr, and no usage event.
+        category, evidence = mr.classify_failure(
+            "codex", stdout="",
+            stderr="Reading additional input from stdin...",
+            returncode=1, completed=False)
+        check("a dead session is not called token exhaustion",
+              category == mr.SESSION_DIED, category)
+        check("the exit code is kept as evidence",
+              any("exit code 1" in e for e in evidence), evidence)
+
+        category, _ = mr.classify_failure(
+            "codex",
+            error_events=["turn.failed: context_length_exceeded: requested 412000 > 400000"],
+            returncode=0, completed=False)
+        check("an overflow event is token exhaustion",
+              category == mr.TOKEN_CONTEXT, category)
+
+        category, _ = mr.classify_failure(
+            "gemini", error_events=["error 429: rate limit exceeded"],
+            returncode=0, completed=False)
+        check("a quota message is quota", category == mr.QUOTA, category)
+
+        category, _ = mr.classify_failure(
+            "codex", stdout="the constant is 14291", returncode=1, completed=False)
+        check("429 does not match inside an ordinary number",
+              category == mr.SESSION_DIED, category)
+
+        with tempfile.TemporaryDirectory() as td:
+            # claude reports failures inside a zero-exit JSON envelope; without
+            # handling it the error string becomes the agent's "response".
+            stub_cli(_CliResult(stdout=json.dumps({
+                "type": "result", "subtype": "error_max_budget_usd",
+                "is_error": True, "result": "Error: max budget reached"})))
+            try:
+                await mr.run_claude_agent("p", td, {"model": "m"}, call_name="verify")
+                check("a claude budget ceiling raises", False)
+            except TokenExhausted as exc:
+                check("a spend ceiling is quota", exc.category == mr.QUOTA, exc.category)
+                check("the message leads with the verdict",
+                      str(exc).startswith("TOKEN EXHAUSTED"), str(exc)[:40])
+                check("the raw output is preserved",
+                      bool(exc.raw_log) and os.path.exists(exc.raw_log), exc.raw_log)
+
+            stub_cli(_CliResult(stdout=json.dumps({
+                "type": "result", "subtype": "error_during_execution",
+                "is_error": True, "result": "prompt is too long: 410000 tokens"})))
+            try:
+                await mr.run_claude_agent("p", td, {"model": "m"}, call_name="prover")
+                check("a claude context overflow raises", False)
+            except TokenExhausted as exc:
+                check("the overflow is attributed to the context window",
+                      exc.category == mr.TOKEN_CONTEXT, exc.category)
+
+            stub_cli(_CliResult(stdout=json.dumps({
+                "type": "result", "subtype": "success", "is_error": False,
+                "result": "done", "modelUsage": {}})))
+            text = await mr.run_claude_agent("p", td, {"model": "m"}, call_name="ok")
+            check("a successful claude call still returns its text", text == "done", text)
+
+            # A failed turn is not an answer, even when it narrated something
+            # first: that narration is what made the 93-minute hang look like
+            # progress.
+            stub_cli(_CliResult(stdout="\n".join([
+                json.dumps({"type": "item.completed",
+                            "item": {"type": "agent_message", "text": "Let me check."}}),
+                json.dumps({"type": "turn.failed",
+                            "error": {"message": "context_length_exceeded"}}),
+            ])))
+            try:
+                await mr.run_codex_agent("p", td, {"model": "m"}, call_name="prover")
+                check("a failed codex turn raises instead of returning narration", False)
+            except TokenExhausted as exc:
+                check("codex turn.failed maps to the context window",
+                      exc.category == mr.TOKEN_CONTEXT, exc.category)
+
+            stub_cli(_CliResult(stdout="", stderr="", returncode=1))
+            try:
+                await mr.run_codex_agent("p", td, {"model": "m"}, call_name="prover")
+                check("a codex crash raises", False)
+            except TokenExhausted:
+                check("a silent crash is not blamed on tokens", False)
+            except ModelRunnerError as exc:
+                check("a silent crash stays a session death",
+                      exc.category == mr.SESSION_DIED, exc.category)
+    finally:
+        mr.run_cli_async = real_run_cli_async
+
+    # -------------------------------------------------------
+    # Test 3g: Halt report
+    # -------------------------------------------------------
+    print("\n=== Test 3g: Halt report ===")
+    with tempfile.TemporaryDirectory() as td:
+        revision = os.path.join(td, "decomposition", "attempt_1", "revision_2")
+        proof_dir = os.path.join(revision, "proof_3")
+        checkpoint_dir = steps_dir(proof_dir)
+        os.makedirs(checkpoint_dir)
+        write_text(os.path.join(revision, "decomposition.yaml"),
+                   "proof_order: [STEP1, STEP2]\n")
+        write_text(os.path.join(checkpoint_dir, "00_front.md"), "# Proof\n\n## Proof\n")
+        write_text(os.path.join(checkpoint_dir, "STEP1.md"),
+                   "### STEP1: First\n\n**Claim:** c.\n\n**Proof:**\n"
+                   + "argument. " * 60)
+        write_text(os.path.join(td, "problem.tex"), "Prove something.\n")
+
+        status_file = os.path.join(td, "decomposition", "STATUS.md")
+        DecompositionLogger(td).update_status(
+            state="PROVING", attempt=1, revision=2, proof=3,
+            recent_activity="single prover running")
+        DecompositionLogger(td)     # reopening must not reset what is on disk
+        after_reopen = read_text(status_file)
+        check("reopening the logger keeps the run's position",
+              "| Attempt | 1 |" in after_reopen and "| Revision | 2 |" in after_reopen
+              and "| Proof | 3 |" in after_reopen, after_reopen)
+
+        exc = TokenExhausted(
+            provider="codex", error_type=mr.TOKEN_CONTEXT, message="x",
+            category=mr.TOKEN_CONTEXT,
+            evidence=["turn.failed: context_length_exceeded"], raw_log="/tmp/raw.log",
+            model="gpt", call_name="single_prover_a1_r2_p3", elapsed=5610.8)
+        report = halt_run(td, exc, problem_file=os.path.join(td, "problem.tex"))
+
+        check("the halt is classified", report["category"] == mr.TOKEN_CONTEXT)
+        check("the halt reports the working position",
+              (report["attempt"], report["revision"], report["proof"]) == (1, 2, 3),
+              report)
+        check("a halt does not consume a proof attempt",
+              report["attempts_consumed"] is False)
+        check("finished steps are assembled into a partial",
+              bool(report["proof_partial"]) and os.path.exists(report["proof_partial"]),
+              report["proof_partial"])
+        # Without proof_partial.md, P1 cannot recognise this as resumable; the
+        # checkpoints would sit on disk and nothing would mark them.
+        check("the partial is what the resume rule looks for",
+              interrupted_partial(proof_dir) == report["proof_partial"],
+              interrupted_partial(proof_dir))
+        check("the missing steps are named",
+              report["checkpoints_missing"] == ["STEP2"], report["checkpoints_missing"])
+
+        halt_md = read_text(os.path.join(td, "HALT.md"))
+        check("HALT.md leads with the verdict",
+              "RUN HALTED — TOKEN EXHAUSTED" in halt_md, halt_md[:60])
+        check("HALT.md points at the raw output", "/tmp/raw.log" in halt_md)
+        check("HALT.md names the resume command", "python code/run.py" in halt_md)
+
+        halted_status = read_text(status_file)
+        check("STATUS.md is set to HALTED", "HALTED" in halted_status, halted_status)
+        check("STATUS.md does not reset the counters",
+              "| Proof | 3 |" in halted_status and "| Revision | 2 |" in halted_status,
+              halted_status)
+        check("halt.json is machine readable",
+              json.loads(read_text(os.path.join(td, "halt.json")))["category"]
+              == mr.TOKEN_CONTEXT)
+        check("the halt exit code stays distinct from a crash", HALT_EXIT_CODE == 3)
 
     # -------------------------------------------------------
     # Test 4: Skill loading

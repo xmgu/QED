@@ -295,7 +295,15 @@ class TokenTracker:
         self.start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     def record(self, call_name: str, input_tokens: int, output_tokens: int,
-               elapsed: float, provider: str = "claude", model: str = ""):
+               elapsed: float, provider: str = "claude", model: str = "",
+               outcome: str = "ok"):
+        """Add one call to the ledger.
+
+        ``outcome`` distinguishes a call that produced an answer from one that
+        did not. Without it a 0/0 row was ambiguous: the same numbers describe
+        a crash, a swallowed context overflow, and a model that answered with
+        two lines of narration. Only the category tells them apart afterwards.
+        """
         self.total_input += input_tokens
         self.total_output += output_tokens
         self.total_elapsed += elapsed
@@ -318,6 +326,7 @@ class TokenTracker:
             "input_tokens": input_tokens,
             "output_tokens": output_tokens,
             "elapsed_s": round(elapsed, 1),
+            "outcome": outcome,
             "cumul_input": self.total_input,
             "cumul_output": self.total_output,
             "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -358,25 +367,25 @@ class TokenTracker:
 
         lines.append("## Per-Call Breakdown\n")
         if len(self.per_provider) > 1:
-            lines.append("| # | Agent | Provider | Input | Output | Time | Cumul In | Cumul Out |")
-            lines.append("|---|-------|----------|------:|-------:|-----:|---------:|----------:|")
+            lines.append("| # | Agent | Provider | Input | Output | Time | Outcome | Cumul In | Cumul Out |")
+            lines.append("|---|-------|----------|------:|-------:|-----:|---------|---------:|----------:|")
         else:
-            lines.append("| # | Agent | Input | Output | Time | Cumul In | Cumul Out |")
-            lines.append("|---|-------|------:|-------:|-----:|---------:|----------:|")
+            lines.append("| # | Agent | Input | Output | Time | Outcome | Cumul In | Cumul Out |")
+            lines.append("|---|-------|------:|-------:|-----:|---------|---------:|----------:|")
 
         for c in self.calls:
             if len(self.per_provider) > 1:
                 lines.append(
                     f"| {c['call']} | {c['name']} | {c.get('provider', 'claude')} "
                     f"| {c['input_tokens']:,} | {c['output_tokens']:,} "
-                    f"| {c['elapsed_s']}s "
+                    f"| {c['elapsed_s']}s | {c.get('outcome', 'ok')} "
                     f"| {c['cumul_input']:,} | {c['cumul_output']:,} |"
                 )
             else:
                 lines.append(
                     f"| {c['call']} | {c['name']} "
                     f"| {c['input_tokens']:,} | {c['output_tokens']:,} "
-                    f"| {c['elapsed_s']}s "
+                    f"| {c['elapsed_s']}s | {c.get('outcome', 'ok')} "
                     f"| {c['cumul_input']:,} | {c['cumul_output']:,} |"
                 )
         lines.append("")
@@ -652,6 +661,39 @@ def _count_decomposition_attempts(output_dir: str) -> tuple[int, int]:
     return attempts, proofs
 
 
+def _announce_halt(report: dict) -> None:
+    """Print the halt in full, so the cause is never something to go looking for.
+
+    The category, the call that produced it, and the evidence behind the
+    decision are all on screen; the reader should not have to open a log or
+    guess whether this was a dead process or an exhausted window.
+    """
+    width = 64
+    print()
+    print("=" * width)
+    print("  RUN HALTED — TOKEN EXHAUSTED")
+    print("=" * width)
+    print(f"  Cause:     {report.get('category')} — {report.get('label')}")
+    print(f"  Call:      {report.get('call_name') or '(unknown)'} "
+          f"({report.get('provider')}/{report.get('model') or '?'})")
+    print(f"  Position:  attempt {report.get('attempt')} / "
+          f"revision {report.get('revision')} / proof {report.get('proof')}")
+    for item in (report.get("evidence") or [])[:5]:
+        print(f"  Evidence:  {' '.join(str(item).split())[:150]}")
+    if report.get("raw_log"):
+        print(f"  Raw:       {report['raw_log']}")
+    if report.get("halt_md"):
+        print(f"  Report:    {report['halt_md']}")
+    print()
+    print("  Preserved: "
+          f"{report.get('proof_partial') or 'no finished step was on disk'}")
+    print("  Proof attempts consumed: no")
+    print()
+    print("  Resume with the same command: the prover continues from the first")
+    print("  missing step instead of rewriting the finished ones.")
+    print("=" * width)
+
+
 async def main():
     parser = argparse.ArgumentParser(description="Proof Agent: natural-language proof search pipeline")
     parser.add_argument("--input", required=True, help="Path to problem.tex file")
@@ -802,23 +844,34 @@ async def main():
     print("  (Decomposition-based proving with step-by-step verification)")
     print("=" * 60)
 
-    from decomposition_prover import run_decomposition_prover
+    from decomposition_prover import (
+        run_decomposition_prover,
+        RunHalted,
+        HALT_EXIT_CODE,
+    )
 
     related_work_file = os.path.join(related_info_dir, "related_work.md")
     # difficulty_evaluation.md is still generated by the literature survey and
     # parsed for the console banner via _parse_difficulty(); the decomposer
     # itself no longer consumes it.
 
-    await run_decomposition_prover(
-        problem_file=problem_file,
-        related_work_file=related_work_file,
-        output_dir=output_dir,
-        config=config,
-        prompts_dir=prompts_dir,
-        claude_opts=claude_opts,
-        logger=PipelineLogger(output_dir, "DecompositionProver"),
-        tracker=tracker,
-    )
+    try:
+        await run_decomposition_prover(
+            problem_file=problem_file,
+            related_work_file=related_work_file,
+            output_dir=output_dir,
+            config=config,
+            prompts_dir=prompts_dir,
+            claude_opts=claude_opts,
+            logger=PipelineLogger(output_dir, "DecompositionProver"),
+            tracker=tracker,
+        )
+    except RunHalted as exc:
+        # A halt is not a failed proof. Stage 2 summarises how the proof search
+        # went, and there is nothing to summarise about a call that never ran;
+        # the run stops here with a resumable state and a distinct exit code.
+        _announce_halt(exc.report)
+        sys.exit(HALT_EXIT_CODE)
 
     proof_file = os.path.join(output_dir, "proof.md")
     ok = os.path.exists(proof_file) and os.path.getsize(proof_file) > 0

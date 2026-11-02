@@ -1,8 +1,83 @@
 # 调用取不到结果时：及时上报并暂停
 
-**状态**：方案，待评审（未实施）
+**状态**：P0 已实施（`refactor/deterministic-verdict`）；P1 预算闸门、P2 空闲看门狗未做
 **涉及模块**：`code/model_runner.py`、`code/compat.py`、`code/decomposition_prover.py`、`code/pipeline.py`、`ui/`
 **日期**：2026-11-02
+
+---
+
+## 实施记录：现在 token 耗尽长什么样
+
+一句话：**它不再是一个需要你去 grep 的 traceback**。同一条结论以三种形式出现，看哪个都行。
+
+**1. 控制台**（进程退出前打印，退出码 3）
+
+```
+================================================================
+  RUN HALTED — TOKEN EXHAUSTED
+================================================================
+  Cause:     token_context — context window exceeded
+  Call:      single_prover_a1_r4_p2 (codex/gpt-6-astra)
+  Position:  attempt 1 / revision 4 / proof 2
+  Evidence:  turn.failed: context_length_exceeded: requested 412000 > 400000
+  Raw:       <output_dir>/runner_failures/20261102_091422_single_prover.log
+  Report:    <output_dir>/HALT.md
+
+  Preserved: <...>/proof_3/proof_partial.md
+  Proof attempts consumed: no
+================================================================
+```
+
+**2. 磁盘**：`HALT.md`（人读，含依据、原始输出路径、保留了什么、下一步）、`halt.json`（机器读）、
+`decomposition/STATUS.md` 变成 `State: HALTED`（UI 面板原样渲染，零改动可见）。
+
+**3. 账本**：`token_usage.json` 每条调用新增 `outcome`，`TOKEN_USAGE.md` 新增 Outcome 列。
+以前 0/0 的那条既可能是崩溃也可能是旁白，现在写着 `incomplete_turn` 或 `token_context`。
+
+### 让它成为「明确结论」而不是「猜测」的三个改动
+
+| 改动 | 为什么必须 |
+|---|---|
+| 每次失败**无条件**把原始 stdout/stderr 存到 `runner_failures/` | 以前原始输出直接丢弃。真实那 4 次崩溃**只留下空 stderr**，事后无从定因 —— 分类器再好也只能猜。这是整条链路的前提 |
+| codex 读 `error` / `turn.failed` 事件，claude 读 `is_error`/`subtype`，gemini 读 `error` 信封 | 三家 CLI 都把失败原因写在结构化信封里；以前只读 `agent_message`，等于把唯一的证据扔掉 |
+| `TokenExhausted(ModelRunnerError)` 子类 + 独立的 `except` | 让"买不起下一次"和"答得不好"分开：前者停运行、不消耗 proof 尝试；后者仍走原来的重试与诚实失败通道 |
+
+### 判定顺序（先命中先定）
+
+`token_context`（上下文超限）→ `token_output`（输出截断）→ `quota`（额度/限流）→
+`session_died`（进程死了）→ `empty_response` → `unknown`。
+
+前四类里只有前三类是 token 耗尽，才会 halt。**`session_died` 不会**——它只是"没结果"，
+重试一次是合理的。
+
+### 证据分级（哪些是验证过的，哪些是推断的）
+
+| 判据 | 状态 |
+|---|---|
+| 退出码 ≠ 0 且无完成事件 → `session_died` | **已验证**：真实运行里 4 次崩溃就是这形态，分类结果必须不是 token |
+| claude `is_error` / `error_max_budget_usd` | 依据 CLI 的 JSON 信封约定，本仓库无真实样本 |
+| codex `error` / `turn.failed` 事件名 | **未验证**：本仓库从未保存过原始 JSONL（原始输出此前直接丢弃），无法核对事件名 |
+| `context length` / `insufficient_quota` / `429` 等文本 pattern | **未验证**：真实日志里只有退出码 1 和空 stderr |
+
+后三行是这套实现最需要被真实运行检验的部分。因此每次失败都强制落 `runner_failures/*.log`：
+下一次真的耗尽时，那份原始 JSONL 就是校准 pattern 的依据，而不是又一轮猜测。
+
+### 刻意不做的事
+
+- **不用时长判定**。健康的 prover 95 分钟，挂死的 93 分钟，时长完全无法区分。
+- **不把"正常退出 + 两行旁白"算作 token 耗尽**。那是 `ProofNotProduced`，属于数学失败。
+  但它的原始会话现在也会存下来，因为"吐了字却没 `turn.completed`"正是被吞掉的上下文错误
+  会呈现的形状——留证，但不改控制流。
+- **`error_max_turns` 不判成 token**。它是轮次预算，不是 token 预算；强行归到 token_context
+  会给出一个自信的错误答案。只有 `error_max_budget_usd` 映射到 `quota`。
+
+### 仍然没有的
+
+| 缺口 | 后果 |
+|---|---|
+| 无 `idle_timeout_s` / `hard_timeout_s` | 93 分钟挂起仍然只能等它自己结束；halt 是在**调用返回之后**才发生的 |
+| 无前置预算闸门 | 无法"在这次调用花钱之前拦住"，只能事后分类 |
+| `compat.run_cli_async(timeout=...)` 仍是死参数 | 传进去会 `TypeError`；P2 才能修 |
 
 ---
 
@@ -263,7 +338,7 @@ runner:
 
 ## 九、分期
 
-### P0：分类 + 上报 + 暂停（不需要流式，风险低，当天可落地）
+### P0：分类 + 上报 + 暂停（已实施）
 
 | 文件 | 改动 |
 |---|---|
@@ -308,14 +383,14 @@ runner:
 
 ## 十一、顺带发现的缺陷（不在本方案范围，但必须记录）
 
-| # | 位置 | 问题 |
-|---|---|---|
-| 1 | `compat.run_cli_async` | `timeout` 参数被传给 `Popen`，而 `Popen` 不认 → 一用就 `TypeError`。今天没有调用方传它，所以没人发现 |
-| 2 | `model_runner.run_gemini_agent` | 引用了从未定义的 `thinking_config`（`model_runner.py:489/473`）→ **每次 Gemini 调用必然 `NameError`**。Gemini 通路目前是死的 |
-| 3 | `DecompositionLogger.update_status` | 只传 `state=` 时把 attempt/revision/proof 重置为 1 |
-| 4 | `token_usage.json` | 不记 `outcome`，0/0 的条目无法区分「崩溃」与「返回旁白」 |
-| 5 | `pipeline.main` | 无顶层异常处理；Stage 2 在崩溃时必然丢失 |
-| 6 | `claude` runner | 对不可恢复错误重试 3 次 × (30+60+120)s 退避，白烧时间和请求 |
+| # | 位置 | 问题 | 状态 |
+|---|---|---|---|
+| 1 | `compat.run_cli_async` | `timeout` 参数被传给 `Popen`，而 `Popen` 不认 → 一用就 `TypeError` | 未修（P2） |
+| 2 | `model_runner.run_gemini_agent` | 引用从未定义的 `thinking_config` → 每次 Gemini 调用必然 `NameError` | **已修**：由 `thinking_level` / `thinking_budget` 构造；否则"换 provider 重跑"这条建议是假的 |
+| 3 | `DecompositionLogger.update_status` | 只传 `state=` 时把 attempt/revision/proof 重置为 1；`__init__` 也会覆盖 STATUS.md | **已修**：日志器持有内存状态，构造时从磁盘恢复 |
+| 4 | `token_usage.json` | 不记 `outcome`，0/0 的条目无法区分「崩溃」与「返回旁白」 | **已修** |
+| 5 | `pipeline.main` | 无顶层异常处理；Stage 2 在崩溃时必然丢失 | **部分**：`RunHalted` 已有处理并跳过 Stage 2；其它异常仍裸抛 |
+| 6 | `claude` runner | 对不可恢复错误重试 3 次 × (30+60+120)s 退避 | **已修**：token 类不重试 |
 
 ---
 
