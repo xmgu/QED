@@ -17,6 +17,7 @@ This is the Stage 1 prover orchestrated by pipeline.py.
 """
 
 import asyncio
+import functools
 import json
 import os
 import yaml
@@ -26,6 +27,55 @@ from typing import Any
 
 from model_runner import run_model, run_model_for_agent, run_claude_agent, ModelRunnerError
 from compat import read_text, write_text
+
+
+# ---------------------------------------------------------------------------
+# QED progress instrumentation (optional)
+# ---------------------------------------------------------------------------
+# Monitoring must never be a prerequisite for proving: when progress_io is
+# unavailable the context manager degrades to a no-op.
+def _load_progress_stage():
+    try:
+        from progress_io import stage as _stage
+        return _stage
+    except ImportError:
+        from contextlib import contextmanager
+
+        @contextmanager
+        def _noop(*_args, **_kwargs):
+            yield
+
+        return _noop
+
+
+progress_stage = _load_progress_stage()
+
+
+def _observed(fn, stage_name: str, agent: str):
+    """Report each agent call as a monitored stage.
+
+    Wrapping the agent entry points instead of individual call sites keeps the
+    resume paths, the legacy fallback branches and any future call site covered
+    without repeating the context manager around every ``await``.
+    """
+    @functools.wraps(fn)
+    async def wrapper(*args, **kwargs):
+        state = kwargs.get("state")
+        if state is None and args:
+            state = args[0]
+        output_dir = getattr(state, "output_dir", None)
+        if not output_dir:
+            return await fn(*args, **kwargs)
+
+        fields = {"agent": agent}
+        for key in ("attempt", "revision", "proof"):
+            value = getattr(state, key, None)
+            if value is not None:
+                fields[key] = value
+        with progress_stage(output_dir, stage_name, **fields):
+            return await fn(*args, **kwargs)
+
+    return wrapper
 
 
 # ---------------------------------------------------------------------------
@@ -2050,6 +2100,21 @@ async def run_decomposition_prover(
     )
 
     return ""
+
+
+# ---------------------------------------------------------------------------
+# Progress instrumentation: bind stages to the agent entry points
+# ---------------------------------------------------------------------------
+# Applied after all definitions so every call site is covered, including the
+# resume branches (verdict/regulator) and the decomposition fallback path.
+run_decomposer = _observed(run_decomposer, "DECOMPOSING", "decomposer")
+run_single_prover = _observed(run_single_prover, "PROVING", "single_prover")
+run_structural_verification = _observed(
+    run_structural_verification, "VERIFYING_STRUCTURAL", "structural_verifier")
+run_detailed_verification = _observed(
+    run_detailed_verification, "VERIFYING_DETAILED", "detailed_verifier")
+run_verdict = _observed(run_verdict, "VERDICT", "verdict")
+run_regulator = _observed(run_regulator, "REGULATING", "regulator")
 
 
 # ---------------------------------------------------------------------------

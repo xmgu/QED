@@ -16,6 +16,7 @@ detection inside <output>/decomposition/.
 
 import asyncio
 import argparse
+import atexit
 import json
 import os
 import shutil
@@ -28,6 +29,40 @@ import yaml
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from compat import decode_kwargs, read_text, resolve_cli, run_cli_async, write_text  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# QED progress instrumentation (optional)
+# ---------------------------------------------------------------------------
+# Monitoring is an add-on, not a prerequisite: if progress_io is missing the
+# pipeline must still start, so the import degrades to no-ops with one warning.
+def _load_progress_io():
+    try:
+        from progress_io import clear_pid, write_live, write_pid
+        return write_pid, write_live, clear_pid
+    except ImportError as exc:
+        print(f"warning: progress instrumentation disabled ({exc})", file=sys.stderr)
+
+        def _nop(*_args, **_kwargs):
+            pass
+
+        return _nop, _nop, _nop
+
+
+write_pid, write_live, clear_pid = _load_progress_io()
+
+# main() cannot run its tail after an exception or Ctrl+C, so the output dir is
+# kept here for the exit guard below to close the run out.
+_ACTIVE_OUTPUT_DIR = None
+
+
+def _mark_abnormal_exit() -> None:
+    """Record a failed run so the monitor does not report it as still running."""
+    if not _ACTIVE_OUTPUT_DIR:
+        return
+    write_live(_ACTIVE_OUTPUT_DIR, stage="pipeline", status="ERROR",
+               agent="pipeline", message="pipeline exited abnormally")
+    clear_pid(_ACTIVE_OUTPUT_DIR)
 
 
 # ---------------------------------------------------------------------------
@@ -653,6 +688,8 @@ def _count_decomposition_attempts(output_dir: str) -> tuple[int, int]:
 
 
 async def main():
+    global _ACTIVE_OUTPUT_DIR
+
     parser = argparse.ArgumentParser(description="Proof Agent: natural-language proof search pipeline")
     parser.add_argument("--input", required=True, help="Path to problem.tex file")
     parser.add_argument("--output", required=True, help="Output directory for proof and logs")
@@ -693,6 +730,16 @@ async def main():
             proving_skill = f.read()
 
     os.makedirs(output_dir, exist_ok=True)
+
+    # --- progress instrumentation: start ---
+    # atexit is the backstop for exits that skip the code below (sys.exit, an
+    # unhandled exception): without it the pid file would outlive the process
+    # and the monitor would keep polling a run that is gone.
+    _ACTIVE_OUTPUT_DIR = output_dir
+    write_pid(output_dir)
+    atexit.register(clear_pid, output_dir)
+    write_live(output_dir, stage="pipeline", status="RUNNING",
+               agent="pipeline", message="pipeline started")
 
     problem_copy = os.path.join(output_dir, "problem.tex")
     if not os.path.exists(problem_copy):
@@ -901,6 +948,24 @@ async def main():
     print(f"  Token usage: {tracker.md_path}")
     print(f"  Output:      {output_dir}")
 
+    # --- progress instrumentation: finish ---
+    # Process-level terminals use FINISHED/STOPPED so they cannot be confused
+    # with the per-stage DONE, which only means one agent has returned.
+    if ok:
+        write_live(output_dir, stage="pipeline", status="FINISHED",
+                   agent="pipeline", message="pipeline finished successfully")
+    else:
+        write_live(output_dir, stage="pipeline", status="STOPPED",
+                   agent="pipeline",
+                   message="pipeline stopped — retry limits exhausted")
+    clear_pid(output_dir)
+
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    try:
+        asyncio.run(main())
+    except BaseException:
+        # The tail of main() does not run when it raises or is interrupted;
+        # close the run out here so the monitor stops claiming it is alive.
+        _mark_abnormal_exit()
+        raise

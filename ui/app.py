@@ -154,6 +154,18 @@ if load_clicked:
 if st.session_state.output_dir and os.path.isdir(st.session_state.output_dir):
     st.caption(f"Current output: `{st.session_state.output_dir}`")
 
+    # Link to the standalone progress monitor. The host defaults to localhost:
+    # a hard-coded LAN address would point at whichever machine the author used.
+    from urllib.parse import quote
+
+    monitor_host = os.environ.get("QED_MONITOR_HOST", "127.0.0.1")
+    monitor_port = os.environ.get("QED_MONITOR_PORT", "8502")
+    monitor_url = (f"http://{monitor_host}:{monitor_port}/monitor"
+                   f"?dir={quote(st.session_state.output_dir)}")
+    st.markdown(
+        f"[打开实时监控页]({monitor_url}) — NiceGUI 进度视图（需独立启动）"
+    )
+
 # Problem statement
 st.warning(
     "The **problem statement** and **global human help** are locked once the pipeline starts. "

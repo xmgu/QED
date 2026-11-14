@@ -317,4 +317,7 @@ ui/proof_runs/
 .config_smoke_tmp.yaml
 .config_run_active.yaml
 
+# Progress instrumentation heartbeat files
+.qed_ui/
+
 proof_output/
