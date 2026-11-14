@@ -38,30 +38,69 @@ from compat import decode_kwargs, read_text, resolve_cli, run_cli_async, write_t
 # pipeline must still start, so the import degrades to no-ops with one warning.
 def _load_progress_io():
     try:
-        from progress_io import clear_pid, write_live, write_pid
-        return write_pid, write_live, clear_pid
+        from progress_io import (clear_pid, set_context, stage, write_live,
+                                 write_pid)
+        return write_pid, write_live, clear_pid, stage, set_context
     except ImportError as exc:
         print(f"warning: progress instrumentation disabled ({exc})", file=sys.stderr)
 
         def _nop(*_args, **_kwargs):
             pass
 
-        return _nop, _nop, _nop
+        class _NoStage:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_exc):
+                return False
+
+        return _nop, _nop, _nop, _NoStage, _nop
 
 
-write_pid, write_live, clear_pid = _load_progress_io()
+write_pid, write_live, clear_pid, progress_stage, set_progress_context = _load_progress_io()
 
 # main() cannot run its tail after an exception or Ctrl+C, so the output dir is
 # kept here for the exit guard below to close the run out.
 _ACTIVE_OUTPUT_DIR = None
+
+# Process-level terminals. Once one of these is on disk the run is over, and the
+# exit guard must not rewrite the record.
+_TERMINAL_STATUSES = ("ERROR", "FINISHED", "STOPPED")
+
+
+def _read_live(output_dir: str) -> dict:
+    """Best-effort read of the record this process last wrote."""
+    path = os.path.join(output_dir, ".qed_ui", "progress_live.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 
 def _mark_abnormal_exit() -> None:
     """Record a failed run so the monitor does not report it as still running."""
     if not _ACTIVE_OUTPUT_DIR:
         return
-    write_live(_ACTIVE_OUTPUT_DIR, stage="pipeline", status="ERROR",
-               agent="pipeline", message="pipeline exited abnormally")
+    current = _read_live(_ACTIVE_OUTPUT_DIR)
+    if current.get("status") == "ERROR":
+        # A stage already failed and recorded why. Keep its stage, error and
+        # attempt coordinates and only replace the message: a generic
+        # ``stage="pipeline"`` record would wipe exactly the detail the monitor
+        # exists to show.
+        carried = {key: current[key] for key in
+                   ("stage", "agent", "attempt", "revision", "proof", "error",
+                    "run_id", "model")
+                   if key in current}
+        write_live(_ACTIVE_OUTPUT_DIR, status="ERROR",
+                   message="pipeline exited abnormally", **carried)
+    elif current.get("status") not in _TERMINAL_STATUSES:
+        write_live(_ACTIVE_OUTPUT_DIR, stage="pipeline", status="ERROR",
+                   agent="pipeline", message="pipeline exited abnormally")
     clear_pid(_ACTIVE_OUTPUT_DIR)
 
 
@@ -731,6 +770,10 @@ async def main():
 
     os.makedirs(output_dir, exist_ok=True)
 
+    # Built before the instrumentation block so the first record can carry the
+    # model: the monitor has no other way to learn which model is in use.
+    claude_opts = make_claude_options(claude_cfg, output_dir)
+
     # --- progress instrumentation: start ---
     # atexit is the backstop for exits that skip the code below (sys.exit, an
     # unhandled exception): without it the pid file would outlive the process
@@ -738,6 +781,12 @@ async def main():
     _ACTIVE_OUTPUT_DIR = output_dir
     write_pid(output_dir)
     atexit.register(clear_pid, output_dir)
+    # Run-level fields live in the writer's context so every later record --
+    # including stage heartbeats -- keeps them.
+    set_progress_context(
+        run_id=f"{datetime.now().strftime('%Y%m%dT%H%M%S')}-{os.getpid()}",
+        model=claude_opts["model"],
+    )
     write_live(output_dir, stage="pipeline", status="RUNNING",
                agent="pipeline", message="pipeline started")
 
@@ -750,7 +799,6 @@ async def main():
     # reflect the latest config.
     shutil.copy2(args.config, os.path.join(output_dir, "config_used.yaml"))
 
-    claude_opts = make_claude_options(claude_cfg, output_dir)
     tracker = TokenTracker(output_dir, claude_opts["model"])
 
     skip_survey = literature_survey_complete(output_dir)
@@ -810,10 +858,14 @@ async def main():
         print("=" * 60)
         print("STAGE 0: Literature Survey")
         print("=" * 60)
-        related_info_dir = await run_literature_survey(
-            output_dir, problem_file, claude_opts, prompts_dir,
-            config=config, math_skill=proving_skill, tracker=tracker,
-        )
+        # The survey is the longest single agent call of the run (minutes), and
+        # it happens before any decomp-prover stage. Without its own heartbeat
+        # the monitor reports STALE for the whole first half of every run.
+        with progress_stage(output_dir, "SURVEY", agent="literature_survey"):
+            related_info_dir = await run_literature_survey(
+                output_dir, problem_file, claude_opts, prompts_dir,
+                config=config, math_skill=proving_skill, tracker=tracker,
+            )
         print(f"  Survey saved to: {related_info_dir}")
 
     difficulty = _parse_difficulty(output_dir)
@@ -839,6 +891,12 @@ async def main():
         print(f"  Proof at:    {proof_file}")
         print(f"  Token usage: {tracker.md_path}")
         print(f"  Output:      {output_dir}")
+        # This early return skips the terminal write at the end of main(), so
+        # close the run out here. Otherwise the last record stays at the
+        # stage-level DONE and the monitor judges a successful run DEAD.
+        write_live(output_dir, stage="pipeline", status="FINISHED",
+                   agent="pipeline", message="pipeline finished (easy path)")
+        clear_pid(output_dir)
         return
 
     # -------------------------------------------------------
@@ -916,16 +974,20 @@ async def main():
             summary_file=summary_file,
             error_file=os.path.join(output_dir, "error_proof_effort_summary.md"),
         )
-        response = await run_auxiliary_agent(
-            agent_role_cfg=summary_role_cfg,
-            prompt=summary_prompt,
-            working_dir=claude_opts.get("cwd", output_dir),
-            config=config,
-            claude_opts=claude_opts,
-            logger=summary_logger,
-            tracker=tracker,
-            call_name="Proof Effort Summary",
-        )
+        # Stage 2 makes another long agent call after the prover has stopped
+        # reporting, so it needs a heartbeat of its own for the same reason
+        # Stage 0 does.
+        with progress_stage(output_dir, "SUMMARY", agent="proof_summary"):
+            response = await run_auxiliary_agent(
+                agent_role_cfg=summary_role_cfg,
+                prompt=summary_prompt,
+                working_dir=claude_opts.get("cwd", output_dir),
+                config=config,
+                claude_opts=claude_opts,
+                logger=summary_logger,
+                tracker=tracker,
+                call_name="Proof Effort Summary",
+            )
         _fallback_save_response(response, [summary_file],
             [os.path.join(output_dir, "error_proof_effort_summary.md")],
             summary_logger, step_name="Proof Effort Summary")

@@ -1,19 +1,24 @@
-"""QED 进度埋点。只写不读，任何异常都吞掉，绝不影响证明主流程。
+"""QED progress reporting. Write-only: every failure is swallowed so that the
+monitor can never affect the proof pipeline itself.
 
-字段约定（schema 2）：
+Schema 2 fields:
 
 ``stage``
-    当前/最近一个阶段名，例如 ``PROVING``、``pipeline``。阶段结束后保持不变，
-    因此界面上看到的永远是"正在做什么"，而不是一个被覆写的 ``DONE``。
+    The stage that is (or was last) running, e.g. ``PROVING`` or ``pipeline``.
+    It is not cleared when the stage ends, so the monitor always shows *what*
+    is being done instead of a ``DONE`` that overwrote it.
 ``status``
-    该阶段的运行状态：``RUNNING`` / ``DONE`` / ``ERROR`` / ``STOPPED``。
-    进程级终态由 pipeline 写入，阶段级终态由 :class:`stage` 写入。
+    How that stage went: ``RUNNING`` / ``DONE`` / ``ERROR`` / ``STOPPED``.
+    Process-level terminals are written by the pipeline, stage-level ones by
+    :class:`stage`.
 
-schema 1 把阶段名与运行状态挤在 ``stage`` 一个字段里，读取端由
-``qed_progress.live`` 负责升级，本模块只写 schema 2。
+Schema 1 squeezed the stage name and the run state into ``stage``; readers
+upgrade it in ``qed_progress.live``, this module only writes schema 2.
 
-并发约定：同一 ``output_dir`` 的阶段不得嵌套。心跳与终态写入由同一把锁
-串行化，退出时先置 ``closed`` 再写终态，从而保证迟到的行为不可能覆盖终态。
+Concurrency: stages must not nest within one ``output_dir``. Heartbeats and
+terminal writes are serialised by the same lock, and ``closed`` is set under
+that lock before the terminal write, so a late heartbeat cannot overwrite a
+terminal state.
 """
 import json
 import os
@@ -25,46 +30,81 @@ _SCHEMA = 2
 _LIVE = "progress_live.json"
 _PID = "pid"
 
-# 写入串行化：心跳线程与主线程都可能写同一个文件。
+# Serialises writes: the heartbeat thread and the main thread both write.
 _lock = threading.Lock()
+
+# Run-level fields repeated in every record (run_id, model, ...). Each write
+# replaces the whole file, so they cannot be written once and left to persist.
+_context = {}
+
+
+def set_context(**fields):
+    """Register fields to repeat in every subsequent record."""
+    _context.update(fields)
 
 
 def _dir(output_dir: str) -> str:
     return os.path.join(output_dir, ".qed_ui")
 
 
-def _atomic_write(path: str, data: dict) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), suffix=".tmp")
+def _replace_retry(tmp: str, path: str, attempts: int = 5,
+                   delay: float = 0.02) -> None:
+    """``os.replace`` with a few retries.
+
+    On Windows the reader can hold the destination open for a moment, and
+    ``os.replace`` then fails with ``PermissionError`` instead of waiting for
+    the handle to close. Without a retry the update is silently lost, which is
+    how a run's ``FINISHED`` record can disappear and the monitor falls back to
+    reporting ``DEAD``.
+    """
+    for attempt in range(attempts):
+        try:
+            os.replace(tmp, path)
+            return
+        except PermissionError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(delay * (attempt + 1))
+
+
+def _atomic_write_text(path: str, text: str) -> None:
+    directory = os.path.dirname(path)
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False)
+            f.write(text)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
+        _replace_retry(tmp, path)
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
 
 
+def _atomic_write(path: str, data: dict) -> None:
+    _atomic_write_text(path, json.dumps(data, ensure_ascii=False))
+
+
 def _write_locked(path: str, fields: dict) -> None:
-    """调用方必须已持有 ``_lock``。"""
+    """Caller must hold ``_lock``."""
     data = {
         "schema_version": _SCHEMA,
         "pid": os.getpid(),
         "ts": time.time(),
         "iso": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        **_context,
         **fields,
     }
     _atomic_write(path, data)
 
 
 def write_pid(output_dir: str) -> None:
+    # Atomic: a reader that catches the file mid-write would get "" and
+    # ``int("")`` would turn the run into a momentary DEAD.
     try:
-        p = os.path.join(_dir(output_dir), _PID)
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        with open(p, "w", encoding="utf-8") as f:
-            f.write(str(os.getpid()))
+        _atomic_write_text(os.path.join(_dir(output_dir), _PID),
+                           str(os.getpid()))
     except Exception:
         pass
 
@@ -86,7 +126,8 @@ def write_live(output_dir: str, **fields) -> None:
 
 
 class Heartbeat:
-    """定期重写当前阶段，让读取端能把"仍在运行"与"卡死"区分开。"""
+    """Rewrite the current stage periodically so that the reader can tell
+    "still running" from "wedged"."""
 
     def __init__(self, output_dir: str, fields: dict, interval: float = 15.0):
         self.output_dir = output_dir
@@ -101,8 +142,9 @@ class Heartbeat:
         while not self._stop.wait(self.interval):
             try:
                 with _lock:
-                    # 关闭标记与终态写入共用一把锁：拿到锁时若已关闭就退出，
-                    # 否则本次写入一定早于终态写入落盘。
+                    # The closed flag shares the lock with the terminal write:
+                    # whoever gets the lock first decides, so this write either
+                    # lands before the terminal one or not at all.
                     if self._closed:
                         return
                     _write_locked(path, self.fields)
@@ -115,19 +157,21 @@ class Heartbeat:
 
     def __exit__(self, *exc):
         self._stop.set()
-        # 先关闸再等线程：关闸保证此后不会再有心跳写入，join 只是回收线程，
-        # 避免它在解释器退出或下一个阶段开始时仍然存活。
+        # Close the gate first, then reap the thread. Once ``closed`` is set the
+        # thread can no longer write, so the join is pure cleanup: a short
+        # timeout keeps a stalled disk from delaying every stage transition.
         try:
             with _lock:
                 self._closed = True
         except Exception:
             pass
         if self._t.is_alive() and threading.current_thread() is not self._t:
-            self._t.join(timeout=self.interval + 5.0)
+            self._t.join(timeout=2.0)
 
 
 class stage:
-    """进入写 RUNNING，正常退出写 DONE，异常退出写 ERROR。阶段名保持不变。"""
+    """Write RUNNING on enter, DONE on normal exit, ERROR on exception. The
+    stage name is left in place so the monitor keeps showing what was running."""
 
     def __init__(self, output_dir: str, name: str, **fields):
         self.output_dir = output_dir
