@@ -251,6 +251,7 @@ This opens the app in your browser (default: <http://localhost:8501>). From ther
 2. **Pick providers / models** — the *Configuration* tab edits `config.yaml` in place (per-agent provider, model, reasoning effort, etc.).
 3. **Run** — hit **Start**. The *Progress* panel shows live indicators for Survey → Decomposition Loop → Summary, with token usage and the latest agent log tail.
 4. **Resume** — if a previous run was interrupted, the UI auto-detects prior progress in the output directory and offers to continue from the last checkpoint.
+5. **Watch it live** — the sidebar's **打开实时监控页** link opens a read-only page that names the agent currently running and the attempt / revision / proof it is on. See [Live progress](#live-progress-the-built-in-monitor); the page is a separate process, so start it with `python -m ui.monitor` first.
 
 Please don't refresh the page. You will lose the pipeline progress if you refresh.
 
@@ -693,7 +694,86 @@ Each pipeline stage writes logs to its own directory under `<output>/`:
 | `log.txt` | `decomposition/` | Timeline of all decomposition agent calls. |
 | `pipeline_stdout.log` | `<output>/` root | Everything the pipeline and the model CLIs printed, including retry notices and CLI exit codes. Shown in the UI under **Pipeline Log (tail)**. |
 
-### Telling a live run from a stalled one
+### Live progress: the built-in monitor
+
+The files above are written to be read after the fact. A run also publishes a
+small machine-readable heartbeat while it works, and two purpose-built viewers
+read it:
+
+| Viewer | Command | Where it shows up |
+|--------|---------|-------------------|
+| Terminal (Textual) | `python -m tui.qed_monitor --output-dir <output>` | your shell |
+| Browser (NiceGUI) | `python -m ui.monitor --dir <output>` | <http://127.0.0.1:8502/monitor> |
+
+Both need one extra dependency, installed separately from the pipeline's own:
+
+```bash
+pip install -r tui/requirements.txt          # textual
+pip install -r ui/monitor/requirements.txt   # nicegui
+```
+
+What they show that the log files cannot: which agent is running *right now*,
+the attempt / revision / proof coordinates it is working at, and how long since
+the last sign of life — as a state to read, not a duration to interpret.
+
+| State | Meaning |
+|-------|---------|
+| `RUNNING` | Heartbeat is fresh and the pid is alive |
+| `STALE` | Alive, but nothing written for `--stale` seconds (default 60) |
+| `DEAD` | The pid is gone and no terminal state was recorded |
+| `DONE` / `STOPPED` | The pipeline exited on its own / gave up after retry limits. In `progress_live.json` the first is spelled `FINISHED`, so that it can never be confused with a stage that merely finished |
+| `ERROR` | The pipeline raised; the exception is shown |
+| `WAITING` | The pid exists but the first heartbeat has not landed yet |
+| `NO LIVE` | No heartbeat and no process — the tree is still displayed |
+| `INCOMPATIBLE SCHEMA` | Heartbeat written by a different `progress_io.py` |
+
+The heartbeat lives in `<output>/.qed_ui/`: `progress_live.json`, rewritten on
+every stage change plus once every 15 seconds, and `pid`. Deleting the directory
+is harmless — the pipeline recreates it, and a monitor that finds it missing
+falls back to scanning `decomposition/`.
+
+#### The three processes are independent
+
+The pipeline, the Streamlit UI and the monitor share nothing but the output
+directory. Neither viewer imports Streamlit, and Streamlit does not need to be
+running for a monitor to work. Start them in whatever order suits you.
+
+**A. Command line only, no Streamlit.** The pipeline and the monitor are two
+shells:
+
+```bash
+python code/run.py problem.tex out/run_01 config.yaml   # shell 1
+python -m ui.monitor --dir out/run_01                   # shell 2
+```
+
+**B. Streamlit as the console.** The UI starts the pipeline for you; the
+monitor runs beside it and is reached from the **打开实时监控页** link on the
+page, which carries the `?dir=` parameter already filled in:
+
+```bash
+python -m streamlit run ui/app.py    # 8501
+python -m ui.monitor                 # 8502 — the directory comes from the link
+```
+
+**C. Monitor first.** Allowed, and it is the intended way to watch a run from
+its first second. An empty directory shows `NO LIVE` and an empty tree; the view
+fills in as soon as the pipeline writes its first heartbeat.
+
+The one thing that has to match is the directory: `--dir` / `--output-dir` must
+be the same path the pipeline was given as its output. If you are unsure, copy
+it from the `Current output:` line in the Streamlit sidebar.
+
+#### Two progress mechanisms, deliberately
+
+The Streamlit *Progress* panel predates the heartbeat and infers liveness from
+the mtime of the newest file in the output directory — see the next section. It
+needs no instrumentation and still works, but it cannot name the agent that is
+running. The heartbeat can, at the cost of touching the pipeline. Both are
+read-only views of the same run, so watching either or both is fine; they agree
+except during a long agent call, where the heartbeat knows what is happening and
+the mtime heuristic can only report that nothing has been written.
+
+### Telling a live run from a stalled one (Streamlit panel)
 
 `STATUS.md` is rewritten only when the pipeline moves from one agent to
 the next, so it says nothing about what happens *during* a call — and a
@@ -776,6 +856,9 @@ For Medium / Hard problems the full layout below is produced. **Easy** problems 
 ├── proof_effort_summary.md               # Stage 2 summary (Medium / Hard only)
 ├── TOKEN_USAGE.md                        # Human-readable token tracking
 ├── token_usage.json                      # Machine-readable token tracking
+├── .qed_ui/                              # Progress heartbeat for the monitors
+│   ├── progress_live.json                #   Current stage / agent / status
+│   └── pid                               #   Pipeline process id
 ├── related_info/                         # Stage 0 output
 │   ├── difficulty_evaluation.md          #   Easy / Medium / Hard
 │   └── related_work.md                   #   Applicable theorems (Medium / Hard only)
@@ -810,10 +893,17 @@ QED/
 ├── code/
 │   ├── run.py                         # Entry point (smoke test + pipeline)
 │   ├── clean.py                       # Removes the generated output directories
+│   ├── compat.py                      # Cross-platform paths, encoding, process trees
 │   ├── pipeline.py                    # Main orchestrator
+│   ├── progress_io.py                 # Writes the .qed_ui/ progress heartbeat
 │   ├── model_runner.py                # Async wrappers for Claude, Codex, Gemini CLIs
 │   ├── decomposition_prover.py        # Decomposition-based prover
 │   └── smoke_test.py                  # Pre-flight validation
+│
+├── qed_progress/                      # Read-only data layer shared by both monitors
+│   ├── live.py                        #   Heartbeat reader + schema upgrade
+│   ├── pid.py                         #   Process liveness
+│   └── tree.py                        #   attempt → revision → proof status
 │
 ├── prompts/                           # Prompt templates ({placeholder} filled at runtime)
 │   ├── literature_survey.md
@@ -836,12 +926,18 @@ QED/
 ├── skill/
 │   └── super_math_skill.md            # Proof methodology system prompt
 │
+├── tui/                               # Standalone Textual live monitor
+│   └── qed_monitor/
+│       └── ...
+│
 └── ui/                                # Streamlit web UI (experimental)
     ├── app.py
     ├── config_panel.py
     ├── process_manager.py
     ├── progress_monitor.py
-    └── utils.py
+    ├── utils.py
+    └── monitor/                       # Standalone NiceGUI live monitor (port 8502)
+        └── ...
 ```
 
 ## Security Warning
