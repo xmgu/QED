@@ -1,16 +1,19 @@
-"""扫描 ``<output_dir>/decomposition``，产出界面用的三层状态树。
+"""Scan ``<output_dir>/decomposition`` into the three-level tree the UIs show.
 
-状态取值：``accepted`` / ``revise_proof`` / ``rejected`` / ``pending`` / ``unknown``。
+Status values: ``accepted`` / ``revise_proof`` / ``rejected`` / ``pending`` /
+``unknown``.
 
-目录层级与落盘位置的对应关系（由真实运行产物核实）：
+Where each status actually lives (verified against real run output):
 
-- ``decomposition/STATUS.md`` —— 唯一一份，记录当前 attempt/revision/proof 编号，
-  但**不在** attempt 或 revision 目录里；
-- ``proof_N/regulator_decision.md`` —— 只有 proof 层有，格式为
-  ``## Decision: REVISE_PLAN``；
-- attempt / revision 目录本身不含任何状态文件。
+- ``decomposition/STATUS.md`` -- one per run; it records the current attempt /
+  revision / proof index but does **not** sit inside an attempt or revision
+  directory;
+- ``proof_N/regulator_decision.md`` -- only the proof level has one, formatted
+  as ``## Decision: REVISE_PLAN``;
+- attempt and revision directories hold no status file of their own.
 
-因此 attempt 与 revision 的状态必须由子节点汇总得出，否则永远是 ``pending``。
+An attempt's or revision's status therefore has to be aggregated from its
+children; reading it directly would leave every one of them at ``pending``.
 """
 import os
 import re
@@ -21,13 +24,20 @@ PATTERNS = {
     "proof": ("proof_",),
 }
 
-ICON = {"accepted": "✓", "rejected": "✗", "revise_proof": "⟳", "pending": "·", "unknown": "?"}
+ICON = {"accepted": "✓", "rejected": "✗", "revise_proof": "⟳",
+        "pending": "·", "unknown": "?"}
 
-# 汇总时的偏好顺序：一次尝试只要有一份 proof 通过，它就应当显示为已通过。
+# Aggregation preference: as soon as one proof of an attempt is accepted, the
+# attempt should be shown as accepted.
 _RANK = {"accepted": 3, "revise_proof": 2, "rejected": 1, "unknown": 1, "pending": 0}
 
 _DECISION_RE = re.compile(
     r"^#{1,6}\s*Decision\s*:\s*([A-Za-z_]+)", re.IGNORECASE | re.MULTILINE
+)
+
+# STATUS.md keeps its state in a markdown table row: ``| State | VERIFYING |``.
+_STATE_RE = re.compile(
+    r"^\|\s*State\s*\|\s*([A-Za-z_]+)\s*\|", re.IGNORECASE | re.MULTILINE
 )
 
 _DECISION_STATUS = {
@@ -39,13 +49,25 @@ _DECISION_STATUS = {
     "REWRITE": "rejected",
 }
 
+_STATE_STATUS = {
+    "DONE": "accepted",
+    "ACCEPTED": "accepted",
+    "VERIFIED": "accepted",
+    "COMPLETE": "accepted",
+    "REVISE_PROOF": "revise_proof",
+    "REJECTED": "rejected",
+    "FAILED": "rejected",
+    "REVISE_PLAN": "rejected",
+    "REWRITE": "rejected",
+}
+
 
 def _match(name, key):
     return any(name.startswith(p) for p in PATTERNS[key])
 
 
 def _natural_key(name: str):
-    """自然排序键：``proof_2`` 排在 ``proof_10`` 之前。"""
+    """Sort key so that ``proof_2`` comes before ``proof_10``."""
     return [int(part) if part.isdigit() else part
             for part in re.split(r"(\d+)", name)]
 
@@ -58,7 +80,7 @@ def _sorted_entries(path):
 
 
 def _status(path):
-    """读取单个目录自身的状态，优先 STATUS.md，降级到 regulator_decision.md。"""
+    """Read one directory's own status: STATUS.md first, then the regulator."""
     sf = os.path.join(path, "STATUS.md")
     if os.path.exists(sf):
         return _parse_status_md(sf)
@@ -69,9 +91,10 @@ def _status(path):
 
 
 def _aggregate(statuses):
-    """由子节点状态汇总父节点状态：取偏好顺序最高者。
+    """Roll child statuses up into the parent: keep the most advanced one.
 
-    没有任何子节点时返回 ``pending``——目录存在但内容未产出，正是这个含义。
+    No children at all means ``pending`` -- the directory exists but has not
+    produced anything yet, which is exactly what that should mean.
     """
     best = "pending"
     for status in statuses:
@@ -81,25 +104,31 @@ def _aggregate(statuses):
 
 
 def _parse_status_md(path):
+    """Read the ``| State | ... |`` row of a STATUS.md.
+
+    Only explicit values count. Substring matching (the previous behaviour)
+    reads a sentence such as "not verified yet" as accepted, so an explicit
+    field -- or an explicit ``Decision:`` line -- is the only signal used.
+    """
     try:
-        text = open(path, encoding="utf-8").read().lower()
+        text = open(path, encoding="utf-8", errors="replace").read()
     except Exception:
         return "unknown"
-    for kw in ("accepted", "verified"):
-        if kw in text:
-            return "accepted"
-    for kw in ("rejected", "failed"):
-        if kw in text:
-            return "rejected"
+    match = _STATE_RE.search(text)
+    if match:
+        return _STATE_STATUS.get(match.group(1).upper(), "unknown")
+    match = _DECISION_RE.search(text)
+    if match:
+        return _DECISION_STATUS.get(match.group(1).upper(), "unknown")
     return "unknown"
 
 
 def _parse_regulator(path):
-    """从 regulator_decision.md 提取决策。
+    """Extract the decision from regulator_decision.md.
 
-    优先读 ``## Decision: XXX`` 这一行。旧的子串匹配只看全文是否出现
-    ``DONE``，正文里写一句 "not DONE" 就会把失败判成通过；只有在缺少
-    Decision 行时才回退到子串匹配。
+    ``## Decision: XXX`` is authoritative. Substring matching over the whole
+    document used to turn any failure whose text merely mentioned ``DONE`` into
+    a pass; it remains only as a fallback for files without a Decision line.
     """
     try:
         text = open(path, encoding="utf-8", errors="replace").read()

@@ -1,4 +1,4 @@
-"""QED 进度共享只读数据层。TUI / NiceGUI 统一从这里读取。"""
+"""Shared read-only data layer for QED progress; both UIs read from here."""
 
 from .live import read_live  # noqa: F401
 from .pid import read_pid, pid_alive  # noqa: F401
