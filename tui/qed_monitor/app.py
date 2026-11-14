@@ -32,6 +32,7 @@ class QEDMonitor(App):
         self.stale_after = stale_after
         self.pid_override = pid_override
         self.no_live = no_live
+        self._tree_signature = None
 
     def compose(self) -> ComposeResult:
         yield StagePanel(id="stage")
@@ -40,8 +41,12 @@ class QEDMonitor(App):
     def on_mount(self):
         self.set_interval(self.interval, self.poll)
         self.poll()
-        self.query_one("#tree", AttemptTree).load(
-            scan_tree(self.output_dir))
+        self.reload_tree()
+
+    def reload_tree(self):
+        data = scan_tree(self.output_dir)
+        self._tree_signature = repr(data)
+        self.query_one("#tree", AttemptTree).load(data)
 
     @work(exclusive=True, thread=True)
     def poll(self):
@@ -51,17 +56,23 @@ class QEDMonitor(App):
         stale = False
         if live and isinstance(live.get("ts"), (int, float)):
             stale = (time.time() - live["ts"]) > self.stale_after
-        self.call_from_thread(self.apply, live, alive, stale, pid)
+        tree_data = scan_tree(self.output_dir)
+        self.call_from_thread(self.apply, live, alive, stale, pid,
+                              tree_data, repr(tree_data))
 
-    def apply(self, live, alive, stale, pid):
+    def apply(self, live, alive, stale, pid, tree_data, tree_signature):
         self.live = live or {}
         self.alive = alive
         self.stale = stale
         self.query_one("#stage", StagePanel).refresh_panel(
             live=self.live, alive=alive, stale=stale, pid=pid)
-        self.query_one("#tree", AttemptTree).highlight(
-            self.live if alive else {})
+        tree = self.query_one("#tree", AttemptTree)
+        if tree_signature != self._tree_signature:
+            # Attempts appear while the run is live. Without this the tree only
+            # ever showed what existed at start-up or at the last manual rescan.
+            self._tree_signature = tree_signature
+            tree.load(tree_data)
+        tree.highlight(self.live if alive else {})
 
     def action_rescan(self):
-        self.query_one("#tree", AttemptTree).load(
-            scan_tree(self.output_dir))
+        self.reload_tree()

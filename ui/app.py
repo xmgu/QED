@@ -163,7 +163,7 @@ if st.session_state.output_dir and os.path.isdir(st.session_state.output_dir):
     monitor_url = (f"http://{monitor_host}:{monitor_port}/monitor"
                    f"?dir={quote(st.session_state.output_dir)}")
     st.markdown(
-        f"[打开实时监控页]({monitor_url}) — NiceGUI 进度视图（需独立启动）"
+        f"[Open live monitor]({monitor_url}) — NiceGUI progress view (runs as a separate process)"
     )
 
 # Problem statement

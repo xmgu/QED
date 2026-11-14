@@ -13,7 +13,7 @@ from .app import start as run  # noqa: E402
 
 def main():
     p = argparse.ArgumentParser(prog="qed-monitor-web")
-    p.add_argument("--dir", default="", help="默认 output_dir")
+    p.add_argument("--dir", default="", help="default output_dir")
     p.add_argument("--host", default="127.0.0.1",
                    help="bind address (default: localhost; the page lists arbitrary dirs)")
     p.add_argument("--port", type=int, default=8502)

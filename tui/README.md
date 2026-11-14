@@ -6,7 +6,7 @@ Zero-deployment terminal UI for monitoring a running QED proof pipeline.
 
 ```bash
 pip install "textual>=0.60,<1.0"
-# 在仓库根目录执行（数据层是根级包 qed_progress）
+# run from the repository root (the data layer is the top-level qed_progress package)
 python -m tui.qed_monitor --output-dir /path/to/proof/output
 ```
 

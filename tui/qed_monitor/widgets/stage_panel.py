@@ -3,10 +3,11 @@ from rich.markup import escape
 
 
 class StagePanel(Static):
-    """顶部状态面板。
+    """Top status panel.
 
-    ``stage`` 是"在做什么"，``status`` 是"做得怎么样"，两者分开显示：
-    阶段结束后 stage 仍保留阶段名，只有 status 变成 DONE。
+    ``stage`` is *what* is running and ``status`` is *how it is going*; they are
+    displayed separately. When a stage ends the name stays put and only the
+    status becomes DONE.
     """
 
     def refresh_panel(self, live, alive, stale, pid):
@@ -17,7 +18,8 @@ class StagePanel(Static):
             state = "INCOMPATIBLE SCHEMA"
         elif status == "ERROR":
             state = f"ERROR: {live.get('error', '')}"
-        # 进程级终态；阶段级 DONE 只表示该 agent 结束，进程仍在跑。
+        # Process-level terminal; a stage-level DONE only means that agent
+        # returned while the process keeps running.
         elif status in ("FINISHED", "STOPPED"):
             state = "DONE" if status == "FINISHED" else "STOPPED"
         elif not alive:
@@ -27,7 +29,8 @@ class StagePanel(Static):
         else:
             state = "RUNNING"
 
-        # 动态字段可能含方括号（如 repr(KeyError('[x]'))），转义后再进 Rich markup。
+        # Dynamic fields may contain brackets (e.g. repr(KeyError('[x]')));
+        # escape them before they reach Rich markup.
         lines = [
             f"[bold]state[/]   {escape(state)}   pid={pid or '—'}",
             f"[bold]stage[/]   {escape(str(live.get('stage', '—'))) if live else '—'}"

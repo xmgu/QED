@@ -1,63 +1,70 @@
-# QED NiceGUI Monitor (A1 阶段)
+# QED NiceGUI Monitor
 
-独立于 Streamlit 的只读实时监控页面，使用 NiceGUI 框架。
+A read-only live view of a running proof pipeline, served as a separate
+[b]NiceGUI[/b] process so it works with or without Streamlit.
 
-## 原理
+## How it works
 
-与 TUI 共享同一 `qed_progress/` 数据层，从 `<output_dir>/.qed_ui/progress_live.json` 轮询。
+It shares the `qed_progress/` data layer with the TUI and polls
+`<output_dir>/.qed_ui/progress_live.json`. The attempt tree is rebuilt from
+`<output_dir>/decomposition` on every refresh, so new attempts, revisions and
+proofs appear while the run is still going.
 
-## 启动
+## Running it
 
 ```bash
-# 安装依赖
-.venv/bin/pip install "nicegui>=1.4,<3.0"
+# from the repository root
+pip install -r ui/monitor/requirements.txt
 
-# 启动（默认 127.0.0.1:8502）
-.venv/bin/python -m ui.monitor --port 8502
+# default bind: 127.0.0.1:8502
+python -m ui.monitor --port 8502
 
-# 浏览器打开
+# then open
 http://127.0.0.1:8502/monitor?dir=/path/to/proof/output
 ```
 
-## 参数
+## Arguments
 
-| 参数 | 默认值 | 说明 |
-|------|--------|------|
-| `--dir` | `""` | 默认 output_dir，留空则在 URL 中通过 `?dir=` 指定 |
-| `--host` | `127.0.0.1` | 监听地址；页面可枚举任意目录，默认仅本机可达，确需局域网访问时显式指定 |
-| `--port` | `8502` | 监听端口 |
-| `--interval` | `1.5` | 轮询间隔（秒） |
-| `--stale` | `60.0` | 超过此秒数判定为 STALE |
-| `--reload` | `false` | 开发热重载 |
-| `--storage-secret` | `QED_MONITOR_SECRET` env | 用于 app.storage.user |
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--dir` | `""` | Default output_dir; when empty, pass `?dir=` in the URL |
+| `--host` | `127.0.0.1` | Bind address. The page can read any directory it is pointed at, so it is localhost-only unless you say otherwise |
+| `--port` | `8502` | Port |
+| `--interval` | `1.5` | Poll interval in seconds |
+| `--stale` | `60.0` | Seconds without a heartbeat before the run is shown as STALE |
+| `--reload` | `false` | Hot reload (development) |
+| `--storage-secret` | `QED_MONITOR_SECRET` env | Secret for `app.storage.user`; an ephemeral one is generated when neither is set |
 
-## 与 Streamlit 的关系
+## Relationship to Streamlit
 
-| 保留 Streamlit | 新增 NiceGUI |
+| Stays in Streamlit | Added here |
 |---|---|
-| 配置编辑（config.yaml、human_help） | /monitor 监控页 |
-| 启动 / 停止 / 恢复 pipeline | 实时 stage / agent / model |
-| 输出目录选择 | attempt → revision → proof 树 |
-| 运行历史列表 | stale / ERROR / DEAD 状态 |
+| Editing `config.yaml` and `human_help` | The `/monitor` page |
+| Starting / stopping / resuming the pipeline | Live stage / agent / model |
+| Choosing the output directory | attempt -> revision -> proof tree |
+| Run history | STALE / ERROR / DEAD states |
 
-启动方式：两个独立进程，Streamlit 中通过"打开监控页"链接跳转。
+The two are separate processes; Streamlit links to this page with the `?dir=`
+parameter already filled in.
 
-## 架构
+## Architecture
 
 ```
-pipeline 进程 ──写──▶ <output_dir>/.qed_ui/progress_live.json
-                              │
-                    ┌─────────▼──────────┐
-                    │  qed_progress/     │  共享只读数据层
-                    │  live/pid/tree     │
-                    └─────┬──────┬───────┘
-                          │      │
-                     TUI  │      │  NiceGUI
-                   (终端) │      │  (浏览器 8502)
-                          │      │
-                    Streamlit (8501) — "打开监控页" 链接
+pipeline process  --write-->  <output_dir>/.qed_ui/progress_live.json
+                                      |
+                            +---------v----------+
+                            |  qed_progress/     |  shared read-only layer
+                            |  live / pid / tree |
+                            +----+----------+----+
+                                 |          |
+                            TUI  |          |  NiceGUI
+                       (terminal) |          |  (browser, 8502)
+                                 |          |
+                           Streamlit (8501) -- "Open live monitor" link
 ```
 
-## 回退
+## Optional by design
 
-删除 `ui/monitor/` 目录和 Streamlit 的 3 行链接即恢复原状。
+Nothing here is imported by the pipeline. Removing `ui/monitor/` and the link in
+`ui/app.py` returns the project to its previous state; the run itself does not
+notice.

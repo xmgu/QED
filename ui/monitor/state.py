@@ -35,8 +35,9 @@ class MonitorState:
         status = self.live.get("status")
         if status == "ERROR":
             return "ERROR"
-        # 只有进程级终态（FINISHED/STOPPED）才算结束。阶段级的 DONE 表示某个
-        # agent 跑完了、进程还在继续，落到下面的存活判断即为 RUNNING。
+        # Only a process-level terminal (FINISHED/STOPPED) means the run is
+        # over. A stage-level DONE just means one agent returned and the process
+        # is still going, which the liveness check below reports as RUNNING.
         if status in ("FINISHED", "STOPPED"):
             return "DONE" if status == "FINISHED" else "STOPPED"
         if not self.alive:

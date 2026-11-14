@@ -251,7 +251,7 @@ This opens the app in your browser (default: <http://localhost:8501>). From ther
 2. **Pick providers / models** — the *Configuration* tab edits `config.yaml` in place (per-agent provider, model, reasoning effort, etc.).
 3. **Run** — hit **Start**. The *Progress* panel shows live indicators for Survey → Decomposition Loop → Summary, with token usage and the latest agent log tail.
 4. **Resume** — if a previous run was interrupted, the UI auto-detects prior progress in the output directory and offers to continue from the last checkpoint.
-5. **Watch it live** — the sidebar's **打开实时监控页** link opens a read-only page that names the agent currently running and the attempt / revision / proof it is on. See [Live progress](#live-progress-the-built-in-monitor); the page is a separate process, so start it with `python -m ui.monitor` first.
+5. **Watch it live** — the sidebar's **Open live monitor** link opens a read-only page that names the agent currently running and the attempt / revision / proof it is on. See [Live progress](#live-progress-the-built-in-monitor); the page is a separate process, so start it with `python -m ui.monitor` first.
 
 Please don't refresh the page. You will lose the pipeline progress if you refresh.
 
@@ -716,6 +716,11 @@ What they show that the log files cannot: which agent is running *right now*,
 the attempt / revision / proof coordinates it is working at, and how long since
 the last sign of life — as a state to read, not a duration to interpret.
 
+Both viewers rescan `decomposition/` on every poll, so a new attempt appears
+while the run is live without pressing `r` or reloading the page, and the node
+the pipeline is on is marked: a `▶` prefix in the browser, reverse video in the
+terminal.
+
 | State | Meaning |
 |-------|---------|
 | `RUNNING` | Heartbeat is fresh and the pid is alive |
@@ -747,7 +752,7 @@ python -m ui.monitor --dir out/run_01                   # shell 2
 ```
 
 **B. Streamlit as the console.** The UI starts the pipeline for you; the
-monitor runs beside it and is reached from the **打开实时监控页** link on the
+monitor runs beside it and is reached from the **Open live monitor** link on the
 page, which carries the `?dir=` parameter already filled in:
 
 ```bash
